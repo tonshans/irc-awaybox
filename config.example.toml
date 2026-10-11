@@ -1,0 +1,66 @@
+# ==============================================================================
+# AwayBox Configuration File
+# Location: /etc/awaybox/config.toml
+# Note: Sensitive secrets (passwords, tokens) must be placed in secrets.env
+# ==============================================================================
+
+[irc]
+# IRC network address and port (default TLS port is 6697)
+server = "irc.libera.chat"
+port = 6697
+tls = true
+
+# Primary identity
+nick = "AwayBox"
+username = "_AwayBox_"
+realname = "IRC AwayBox"
+
+# Default channels joined automatically on startup & restored on service restart
+default_channels = ["#indonesia", "#melawai"]
+
+# NickServ Nickname Authentication (Password read from IRC_PASSWORD in secrets.env)
+nickserv_enabled = true
+nickserv_command = "NickServ@services.dal.net :IDENTIFY {password}"
+
+# Optional ChanServ post-join command template (e.g. "OP {channel}")
+chanserv_enabled = false
+chanserv_command = "ChanServ@services.dal.net :OP {channel}"
+chanserv_command_template = "ChanServ@services.dal.net :OP {channel}"
+
+[autoreply]
+# Enable or disable auto-reply functionality
+enabled = true
+
+# The automated response message transmitted to IRC
+message = "Saya sedang offline. Pesan kamu akan disampaikan."
+
+# Channels where auto-reply is permitted (PMs are always supported independently)
+default_channels = ["#indonesia"]
+
+# Cooldown duration per nickname in seconds (shared across PM and channel)
+cooldown_seconds = 300
+
+[telegram]
+# Numeric Telegram user ID of the authorized owner (Strict single-user authorization)
+# You can find your numeric ID using Telegram bots like @userinfobot
+allowed_user_id = 123456789
+
+# Lifetime of an active reply session in seconds
+reply_session_timeout_seconds = 120
+
+# Maximum number of lines returned by /log command
+log_max_lines = 20
+
+[logging]
+# Directory where plain-text log files are recorded
+log_dir = "/var/lib/awaybox/logs"
+
+[reconnect]
+# Initial delay in seconds before first reconnection attempt
+initial_delay_seconds = 5
+
+# Maximum backoff ceiling in seconds (5, 10, 20, 40, 80, 160, 300)
+max_delay_seconds = 300
+
+# Exponential backoff multiplier
+backoff_multiplier = 2.0

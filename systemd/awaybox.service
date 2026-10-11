@@ -1,0 +1,40 @@
+[Unit]
+Description=AwayBox - Persistent IRC Mailbox & Telegram Relay
+Documentation=https://github.com/awaybox/awaybox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=awaybox
+Group=awaybox
+
+# Environment and Execution
+EnvironmentFile=-/etc/awaybox/secrets.env
+ExecStart=/opt/awaybox/venv/bin/python -m awaybox.main --config /etc/awaybox/config.toml --secrets /etc/awaybox/secrets.env
+WorkingDirectory=/opt/awaybox
+
+# Process Lifecycle & Automatic Restarts
+Restart=always
+RestartSec=10s
+TimeoutStopSec=15s
+
+# Security Hardening (Non-root, strict sandboxing)
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Writable directories (logs only)
+ReadWritePaths=/var/lib/awaybox/logs
+
+# Standard output and error to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=awaybox
+
+[Install]
+WantedBy=multi-user.target
