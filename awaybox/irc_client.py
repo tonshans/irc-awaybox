@@ -27,6 +27,13 @@ from awaybox.config import AppConfig
 from awaybox.logger import AwayBoxLogger
 from awaybox.state import RuntimeState
 
+# Numeric WHOIS reply codes whose target nickname lives in params[1]
+# (kept in sync with awaybox.telegram_bot._WHOIS_RPL_CODES).
+_WHOIS_RPL_CODES = frozenset(
+    "250 251 252 253 254 255 256 257 258 259 260 261 262 265 276 278 "
+    "307 311 312 313 317 318 319 320 321 323 330 335 337 338 340 378 379 402".split()
+)
+
 
 class IRCMessage:
     def __init__(self, raw: str) -> None:
@@ -86,14 +93,17 @@ class IRCClient:
         state: RuntimeState,
         logger: AwayBoxLogger,
         on_message_callback: Optional[Callable[[str, str, str, bool], None]] = None,
+        on_whois_reply_callback: Optional[Callable[[str, str, bool], None]] = None,
     ) -> None:
         """
         on_message_callback(sender, target, text, is_channel)
+        on_whois_reply_callback(target_nick, line, final)
         """
         self.config = config
         self.state = state
         self.logger = logger
         self.on_message = on_message_callback
+        self.on_whois_reply = on_whois_reply_callback
 
         self._socket: Optional[socket.socket | ssl.SSLSocket] = None
         self._stop_event = threading.Event()
@@ -144,6 +154,13 @@ class IRCClient:
         if not clean_text:
             return False
         return self._send_raw(f"PRIVMSG {target} :{clean_text}")
+
+    def send_whois(self, nickname: str) -> bool:
+        """Sends a WHOIS request for a single nickname."""
+        nick = nickname.strip()
+        if not nick or not self.is_connected:
+            return False
+        return self._send_raw(f"WHOIS {nick}")
 
     def join_channel(self, channel: str) -> bool:
         """Sends JOIN command and tracks in runtime state."""
@@ -285,6 +302,28 @@ class IRCClient:
 
             if self.on_message:
                 self.on_message(sender, target, text, is_channel)
+            return
+
+        # Handle WHOIS numeric replies (RPL_* / ERR_NOSUCHNICK)
+        if msg.command.isdigit():
+            self._handle_whois_numeric(msg)
+
+    def _handle_whois_numeric(self, msg: IRCMessage) -> None:
+        """Routes a numeric reply that belongs to a pending WHOIS query."""
+        code = msg.command
+        if code not in _WHOIS_RPL_CODES and code != "401":
+            return
+        if len(msg.params) < 3:
+            return
+
+        target_nick = msg.params[1]
+        if not self.state.has_pending_whois(target_nick):
+            return
+
+        line = " ".join(msg.params[2:]).strip()
+        final = code in ("318", "401")
+        if self.on_whois_reply:
+            self.on_whois_reply(target_nick, line, final)
 
     def _run_loop(self) -> None:
         """Main IRC worker thread with automatic backoff reconnection loop."""

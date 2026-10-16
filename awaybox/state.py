@@ -12,8 +12,16 @@ Maintains transient runtime state that is NOT persisted to the config file:
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, Optional, Set
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Set
 from awaybox.config import AppConfig
+
+
+@dataclass
+class _WhoisBuffer:
+    """A pending WHOIS reply buffer for one nickname."""
+    lines: List[str] = field(default_factory=list)
+    completed: bool = False  # True once the server sent RPL_ENDOFWHOIS
 
 
 class RuntimeState:
@@ -40,7 +48,10 @@ class RuntimeState:
         # 4. Auto-reply cooldown timestamps: lowercase_nick -> float timestamp
         self._cooldown_timestamps: Dict[str, float] = {}
 
-        # 5. Runtime stats & status
+        # 5. Pending WHOIS buffers: nick -> _WhoisBuffer (reply lines + completion flag)
+        self._pending_whois: Dict[str, _WhoisBuffer] = {}
+
+        # 6. Runtime stats & status
         self.irc_connected: bool = False
         self.irc_authenticated: bool = False
         self.telegram_active: bool = False
@@ -164,3 +175,53 @@ class RuntimeState:
         curr = now if now is not None else time.time()
         remaining = self.config.autoreply.cooldown_seconds - (curr - last_time)
         return max(0, int(remaining))
+
+    # ---- Pending WHOIS Buffers ----
+    @property
+    def pending_whois(self) -> Dict[str, List[str]]:
+        return {k: list(v.lines) for k, v in self._pending_whois.items()}
+
+    def has_pending_whois(self, nickname: str) -> bool:
+        """Returns True if a pending WHOIS buffer exists for the nickname (case-insensitive)."""
+        if not nickname:
+            return False
+        return nickname.strip().lower() in self._pending_whois
+
+    def register_whois(self, nickname: str, completed: bool = False) -> bool:
+        """Registers a pending WHOIS buffer for the nickname.
+
+        Returns False if a buffer already exists for that nickname.
+        `completed=True` marks the request as finished (server sent RPL_ENDOFWHOIS);
+        the buffered lines stay available for delivery until popped.
+        """
+        nick = nickname.strip()
+        if not nick:
+            return False
+        key = nick.lower()
+        if key in self._pending_whois:
+            return False
+        self._pending_whois[key] = _WhoisBuffer(completed=completed)
+        return True
+
+    def mark_whois_completed(self, nickname: str) -> bool:
+        """Flags an existing pending buffer as fully received. Returns False if absent."""
+        buf = self._pending_whois.get(nickname.strip().lower())
+        if buf is None:
+            return False
+        buf.completed = True
+        return True
+
+    def append_whois_reply(self, nickname: str, line: str) -> bool:
+        """Appends a server reply line to the pending WHOIS buffer. Returns False if no buffer exists."""
+        buf = self._pending_whois.get(nickname.strip().lower())
+        if buf is None:
+            return False
+        buf.lines.append(line)
+        return True
+
+    def pop_whois_buffer(self, nickname: str) -> Optional[List[str]]:
+        """Removes and returns the pending WHOIS buffer lines, or None if not found."""
+        buf = self._pending_whois.pop(nickname.strip().lower(), None)
+        if buf is None:
+            return None
+        return list(buf.lines)

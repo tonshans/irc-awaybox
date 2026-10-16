@@ -5,7 +5,7 @@ Provides the remote control interface via Telegram Bot API using long polling:
 - Strict authorization check (numeric allowed_user_id only)
 - Interactive notifications with inline reply buttons
 - Reply session workflow management
-- Commands: /start, /status, /channels, /msg, /join, /leave, /autoreply, /ignore, /unignore, /log, /cancel
+- Commands: /start, /status, /channels, /msg, /join, /leave, /autoreply, /ignore, /unignore, /log, /whois, /cancel
 - Fault isolation: Telegram outages do not crash IRC logging or connection
 """
 
@@ -26,6 +26,22 @@ from awaybox.logger import AwayBoxLogger
 from awaybox.reply_manager import ReplyManager
 from awaybox.state import RuntimeState
 
+# Canonical IRC nickname validation pattern (RFC 1459 / modern servers).
+# NOTE: a space is intentionally NOT part of the character class.
+# Use _NICK_RE.fullmatch(...) everywhere so partial matches can never slip through.
+_NICK_RE = re.compile(r"[A-Za-z0-9_\\{}\^|`~-]{1,30}")
+
+# Numeric WHOIS reply codes whose target nickname lives in params[1].
+_WHOIS_RPL_CODES = frozenset(
+    "250 251 252 253 254 255 256 257 258 259 260 261 262 265 276 278 "
+    "307 311 312 313 317 318 319 320 321 323 330 335 337 338 340 378 379 402".split()
+)
+
+
+def is_valid_nick(nickname: str) -> bool:
+    """Returns True only if the whole string is a valid single IRC nickname."""
+    return bool(_NICK_RE.fullmatch(nickname))
+
 
 class TelegramBot:
     def __init__(
@@ -37,6 +53,7 @@ class TelegramBot:
         irc_send_func: Optional[Callable[[str, str], bool]] = None,
         irc_join_func: Optional[Callable[[str], bool]] = None,
         irc_leave_func: Optional[Callable[[str], bool]] = None,
+        irc_whois_func: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -45,6 +62,7 @@ class TelegramBot:
         self.irc_send = irc_send_func
         self.irc_join = irc_join_func
         self.irc_leave = irc_leave_func
+        self.irc_whois = irc_whois_func
 
         self.token = config.telegram_bot_token or ""
         self.allowed_user_id = config.telegram.allowed_user_id
@@ -207,6 +225,7 @@ class TelegramBot:
                 "/autoreply [on|off|add #ch|remove #ch] - Kelola auto-reply\n"
                 "/ignore [Nick] - Lihat atau tambah ignore list\n"
                 "/unignore Nick - Hapus dari ignore list\n"
+                "/whois Nick - Informasi user IRC (realname, server, channels)\n"
                 "/log [#ch|Nick] - Ambil cuplikan riwayat pesan\n"
                 "/cancel - Batalkan sesi balasan aktif"
             )
@@ -269,7 +288,7 @@ class TelegramBot:
                     )
             else:
                 # Validate nickname format
-                if not re.match(r"^[A-Za-z0-9_\\\[\]\{\}\^\`\|-]{1,30}$", target):
+                if not is_valid_nick(target):
                     return "Nickname tidak valid."
 
             if not self.state.irc_connected:
@@ -379,7 +398,7 @@ class TelegramBot:
                     return "Daftar ignore kosong."
                 return "<b>Nickname Diabaikan:</b>\n" + "\n".join(f"• {n}" for n in ignored)
             nick = args[0]
-            if not re.match(r"^[A-Za-z0-9_\\\[\]\{\}\^\`\|-]+$", nick):
+            if not is_valid_nick(nick):
                 return "Nickname tidak valid."
             added = self.state.add_ignore(nick)
             if added:
@@ -394,6 +413,50 @@ class TelegramBot:
             if removed:
                 return f"Nickname <code>{nick}</code> dihapus dari ignore list."
             return f"Nickname <code>{nick}</code> tidak ditemukan di ignore list."
+
+        elif cmd == "/whois":
+            if not args:
+                return "Gunakan: /whois Nick"
+            # handle_command splits on whitespace, so extra tokens mean the user
+            # typed something like "/whois bad nick here". A WHOIS target must be
+            # exactly ONE nickname — reject multi-token input outright instead of
+            # silently validating only the first fragment ("bad").
+            if len(args) != 1:
+                return "Nickname tidak valid (hanya satu nickname, tanpa spasi). Gunakan: /whois Nick"
+            target_nick = args[0]
+            # Strict single-nickname validation (fullmatch): strings containing
+            # spaces like "bad nick here" are rejected outright and must NOT
+            # register a pending WHOIS buffer.
+            if not is_valid_nick(target_nick):
+                return "Nickname tidak valid. Gunakan: /whois Nick"
+
+            if not self.state.irc_connected:
+                return "⚠️ Tidak dapat melakukan WHOIS: Koneksi IRC sedang terputus."
+
+            requested = target_nick.lower()
+
+            # Reply still in transit: do not spam a duplicate WHOIS request.
+            if self.state.has_pending_whois(requested):
+                return f"Hasil WHOIS untuk <code>{target_nick}</code> masih diproses, coba lagi sebentar."
+
+            # Already-completed reply waiting in the buffer (auto-delivery may have
+            # failed while Telegram was down): deliver it now instead of re-requesting.
+            buffered = self.state.pop_whois_buffer(requested)
+            if buffered is not None:
+                body = "\n".join(buffered) if buffered else "(tidak ada detail dari server)"
+                return f"<b>WHOIS {target_nick}:</b>\n<pre>{body}</pre>"
+
+            sent = False
+            if self.irc_whois:
+                sent = bool(self.irc_whois(target_nick))
+            if not sent:
+                return f"⚠️ Gagal meminta WHOIS untuk <code>{target_nick}</code>: koneksi IRC sedang terputus."
+
+            self.state.register_whois(requested)
+            return (
+                f"WHOIS untuk <code>{target_nick}</code> diminta. "
+                f"Hasil akan dikirim otomatis begitu balasan server diterima."
+            )
 
         elif cmd == "/log":
             if not args:
@@ -418,6 +481,35 @@ class TelegramBot:
             return "Tidak ada sesi balasan aktif yang perlu dibatalkan."
 
         return "Perintah tidak dikenal. Ketik /start untuk melihat panduan."
+
+    # ---- WHOIS Reply Handling (invoked from the IRC worker thread) ----
+    def handle_whois_reply(self, target_nick: str, line: str, final: bool) -> None:
+        """
+        Accumulates numeric WHOIS reply lines into the pending buffer for
+        target_nick and pushes the finished report to Telegram on RPL_ENDOFWHOIS.
+        Lines arriving without a matching pending request are ignored.
+        """
+        if not self.state.append_whois_reply(target_nick, line):
+            return
+        if not final:
+            return
+
+        # Mark the buffer complete FIRST: if the Telegram push below fails, the
+        # finished result stays available so a follow-up /whois delivers it from
+        # the cache instead of reporting "still processing" forever.
+        self.state.mark_whois_completed(target_nick)
+        buffered = self.state.pop_whois_buffer(target_nick) or []
+        body = "\n".join(buffered) if buffered else "(tidak ada detail dari server)"
+        try:
+            self.send_message(
+                f"<b>WHOIS {target_nick}:</b>\n<pre>{body}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            # Telegram outage must not lose the result: keep it cached for
+            # delivery on the next /whois Nick command.
+            self.state.register_whois(target_nick, completed=True)
+            self.state.append_whois_reply(target_nick, body)
 
     # ---- Callback Query Handling (Button Clicks) ----
     def handle_callback_query(self, cb: Dict[str, Any]) -> None:
