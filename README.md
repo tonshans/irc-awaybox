@@ -13,7 +13,7 @@ AwayBox keeps your presence on IRC while you are offline. It archives messages t
 - **Telegram Remote Control**:
   - Notifikasi pesan instan dengan tombol inline `Reply Channel` dan `Private <sender>`.
   - Satu ketukan untuk mengaktifkan sesi balasan berbatas waktu.
-  - Perintah kendali lengkap: `/status`, `/channels`, `/join`, `/leave`, `/autoreply`, `/ignore`, `/unignore`, `/log`, `/cancel`.
+  - Perintah kendali lengkap: `/status`, `/channels`, `/msg`, `/join`, `/leave`, `/autoreply`, `/ignore`, `/unignore`, `/log`, `/cancel`.
 - **Auto-Reply & Anti-Spam Cooldown**:
   - Respons otomatis terukur untuk private message dan channel tertentu.
   - Cooldown cerdas per-nickname (case-insensitive) bersama agar tidak membanjiri lawan bicara.
@@ -92,6 +92,7 @@ sudo systemctl status awaybox
 | `/start` | Menampilkan panduan dan daftar perintah |
 | `/status` | Status koneksi IRC, Telegram, channel aktif, uptime |
 | `/channels` | Menampilkan channel IRC yang sedang aktif |
+| `/msg #ch/Nick <pesan>` | Mengirim pesan langsung dari Telegram ke channel/nickname IRC |
 | `/join #channel` | Meminta AwayBox bergabung ke channel |
 | `/leave #channel` | Meminta AwayBox meninggalkan channel |
 | `/autoreply` | Menampilkan pengaturan auto-reply saat ini |

@@ -5,7 +5,7 @@ Provides the remote control interface via Telegram Bot API using long polling:
 - Strict authorization check (numeric allowed_user_id only)
 - Interactive notifications with inline reply buttons
 - Reply session workflow management
-- Commands: /start, /status, /channels, /join, /leave, /autoreply, /ignore, /unignore, /log, /cancel
+- Commands: /start, /status, /channels, /msg, /join, /leave, /autoreply, /ignore, /unignore, /log, /cancel
 - Fault isolation: Telegram outages do not crash IRC logging or connection
 """
 
@@ -201,6 +201,7 @@ class TelegramBot:
                 "Perintah tersedia:\n"
                 "/status - Status koneksi IRC & layanan\n"
                 "/channels - Daftar channel aktif\n"
+                "/msg #channel|Nick pesan - Kirim pesan langsung ke channel/nickname IRC\n"
                 "/join #channel - Masuk ke channel\n"
                 "/leave #channel - Keluar dari channel\n"
                 "/autoreply [on|off|add #ch|remove #ch] - Kelola auto-reply\n"
@@ -248,6 +249,47 @@ class TelegramBot:
                 return "Tidak ada channel aktif saat ini."
             return "<b>Channel Aktif:</b>\n" + "\n".join(f"• {c}" for c in channels)
 
+        elif cmd == "/msg":
+            if len(args) < 2:
+                return "Gunakan: /msg #channel|Nick isi pesan"
+            target = args[0]
+            message = " ".join(args[1:]).strip()
+            if not message:
+                return "Pesan tidak boleh kosong. Gunakan: /msg #channel|Nick isi pesan"
+
+            is_channel = target.startswith("#") or target.startswith("&")
+            if is_channel:
+                # Strict format validation: clean IRC channel name
+                if not re.match(r"^[#&][^\x00\x07\x0a\x0d ,:]+$", target):
+                    return "Nama channel tidak valid."
+                if not self.state.has_channel(target):
+                    return (
+                        f"AwayBox belum berada di channel <code>{target}</code>.\n"
+                        f"Gunakan /join {target} terlebih dahulu."
+                    )
+            else:
+                # Validate nickname format
+                if not re.match(r"^[A-Za-z0-9_\\\[\]\{\}\^\`\|-]{1,30}$", target):
+                    return "Nickname tidak valid."
+
+            if not self.state.irc_connected:
+                return "⚠️ Gagal mengirim: Koneksi IRC sedang terputus."
+
+            sent = False
+            if self.irc_send:
+                sent = self.irc_send(target, message)
+
+            if not sent:
+                return f"⚠️ Gagal mengirim pesan ke <code>{target}</code> melalui IRC."
+
+            # Log as OUT message
+            if is_channel:
+                self.logger.log_channel_message(target, self.config.irc.nick, message)
+            else:
+                self.logger.log_private_outgoing(target, self.config.irc.nick, message)
+
+            return f"✅ Pesan berhasil dikirim ke <code>{target}</code> di IRC."
+
         elif cmd == "/join":
             if not args:
                 return "Gunakan: /join #channel"
@@ -258,11 +300,18 @@ class TelegramBot:
             if not re.match(r"^[#&][^\x00\x07\x0a\x0d ,:]+$", target_ch):
                 return "Nama channel tidak valid."
 
+            joined = False
             if self.irc_join:
-                self.irc_join(target_ch)
+                joined = bool(self.irc_join(target_ch))
             else:
-                self.state.add_channel(target_ch)
-            return f"Meminta AwayBox bergabung ke <code>{target_ch}</code>."
+                joined = self.state.add_channel(target_ch)
+
+            if joined:
+                return f"Meminta AwayBox bergabung ke <code>{target_ch}</code>."
+            return (
+                f"⚠️ Gagal bergabung ke <code>{target_ch}</code>: "
+                f"koneksi IRC sedang terputus atau channel sudah aktif."
+            )
 
         elif cmd == "/leave":
             if not args:
@@ -271,11 +320,22 @@ class TelegramBot:
             if not self.state.has_channel(target_ch):
                 return f"AwayBox tidak berada di channel <code>{target_ch}</code>."
 
+            # Resolve the exact case as tracked in runtime state for a reliable PART
+            resolved = target_ch
+            for existing in self.state.active_channels:
+                if existing.lower() == target_ch.strip().lower():
+                    resolved = existing
+                    break
+
+            left = False
             if self.irc_leave:
-                self.irc_leave(target_ch)
+                left = bool(self.irc_leave(resolved))
             else:
-                self.state.remove_channel(target_ch)
-            return f"Meminta AwayBox meninggalkan <code>{target_ch}</code>."
+                left = self.state.remove_channel(resolved)
+
+            if left:
+                return f"Meminta AwayBox meninggalkan <code>{resolved}</code>."
+            return f"⚠️ Gagal meninggalkan <code>{resolved}</code>: koneksi IRC sedang terputus."
 
         elif cmd == "/autoreply":
             if not args:
