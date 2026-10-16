@@ -44,6 +44,7 @@ class AwayBoxApp:
             state=self.state,
             logger=self.logger,
             on_message_callback=self.on_irc_message_received,
+            on_whois_reply_callback=self.on_whois_reply,
         )
 
         # 3. Telegram Bot
@@ -55,9 +56,14 @@ class AwayBoxApp:
             irc_send_func=self.irc_client.send_privmsg,
             irc_join_func=self.irc_client.join_channel,
             irc_leave_func=self.irc_client.leave_channel,
+            irc_whois_func=self.irc_client.send_whois,
         )
 
         self._running = False
+
+    def on_whois_reply(self, target_nick: str, line: str, final: bool) -> None:
+        """Forwards buffered WHOIS server replies to the Telegram bot."""
+        self.telegram_bot.handle_whois_reply(target_nick, line, final)
 
     def on_irc_message_received(self, sender: str, target: str, text: str, is_channel: bool) -> None:
         """
