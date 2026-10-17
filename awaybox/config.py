@@ -165,6 +165,10 @@ class ReconnectConfig:
     initial_delay_seconds: int = 5
     max_delay_seconds: int = 300
     backoff_multiplier: float = 2.0
+    # Keepalive tuning (see awaybox/irc_client.py)
+    read_timeout_seconds: float = 60.0     # socket recv timeout / wake-up cadence
+    ping_interval_seconds: float = 45.0    # proactive client PING frequency
+    pong_deadline_seconds: float = 150.0   # silence after PING before declaring link dead
 
 
 @dataclass
@@ -285,6 +289,9 @@ def load_config(
         initial_delay_seconds=int(rec_sec.get("initial_delay_seconds", 5)),
         max_delay_seconds=int(rec_sec.get("max_delay_seconds", 300)),
         backoff_multiplier=float(rec_sec.get("backoff_multiplier", 2.0)),
+        read_timeout_seconds=float(rec_sec.get("read_timeout_seconds", 60.0)),
+        ping_interval_seconds=float(rec_sec.get("ping_interval_seconds", 45.0)),
+        pong_deadline_seconds=float(rec_sec.get("pong_deadline_seconds", 150.0)),
     )
 
     app_config = AppConfig(

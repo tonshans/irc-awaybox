@@ -123,6 +123,19 @@ class IRCClient:
         self._connected = False
         self._backoff = float(config.reconnect.initial_delay_seconds)
 
+        # --- Keepalive / timeout hardening -----------------------------------
+        # Read timeout on the socket: short enough to notice dead/half-open
+        # links quickly, long enough that normal traffic keeps us awake.
+        self._read_timeout = float(getattr(config.reconnect, "read_timeout_seconds", 60.0))
+        # How often we proactively send our own PING when the link is idle.
+        self._ping_interval = float(getattr(config.reconnect, "ping_interval_seconds", 45.0))
+        # If the server has not sent ANYTHING for this many seconds since our
+        # last PING, consider the link dead and force a reconnect.
+        self._pong_deadline = float(getattr(config.reconnect, "pong_deadline_seconds", 150.0))
+        self._last_recv_time = 0.0
+        self._last_ping_sent = 0.0
+        self._awaiting_pong = False
+
     @property
     def is_connected(self) -> bool:
         return self._connected
@@ -275,11 +288,18 @@ class IRCClient:
             else:
                 sock = raw_sock
 
-            sock.settimeout(300.0)  # PING timeout headroom
+            sock.settimeout(self._read_timeout)  # wake up regularly for keepalive checks
             self._socket = sock
             self._connected = True
             self.state.irc_connected = True
             self.state.reconnect_attempts = 0
+
+            # Seed keepalive timers so the first proactive PING fires after
+            # _ping_interval seconds of idleness, not immediately.
+            now = time.monotonic()
+            self._last_recv_time = now
+            self._last_ping_sent = now
+            self._awaiting_pong = False
 
             # Handshake: NICK and USER
             self._send_raw(f"NICK {cfg.nick}")
@@ -458,16 +478,52 @@ class IRCClient:
                     self._disconnect(reason="Server IRC menutup koneksi (socket closed by remote).")
                     continue
 
+                now = time.monotonic()
+                self._last_recv_time = now
+                # Any traffic from the server proves the link is alive;
+                # clear the pending PING state.
+                self._awaiting_pong = False
+
                 buffer += chunk.decode("utf-8", errors="replace")
                 while "\r\n" in buffer:
                     line, buffer = buffer.split("\r\n", 1)
                     if line:
                         self._process_line(line)
-            except (socket.timeout, ssl.SSLError) as e:
-                # Idle socket timeout or SSL timeout
-                if "timed out" in str(e).lower():
-                    # Send keepalive ping
+
+                # Proactive keepalive: if the link has been idle past the
+                # ping interval, send our own PING so neither we nor the
+                # server ever considers the connection stale.
+                if now - self._last_ping_sent >= self._ping_interval:
                     self._send_raw(f"PING :{self.config.irc.server}")
+                    self._last_ping_sent = now
+                    self._awaiting_pong = True
+            except (socket.timeout, ssl.SSLError) as e:
+                # Idle socket read timeout: this is EXPECTED every
+                # _read_timeout seconds and is how we get a chance to run
+                # keepalive checks on a quiet link.
+                if "timed out" in str(e).lower():
+                    now = time.monotonic()
+
+                    # Server silent too long since our last PING -> the link
+                    # is dead/half-open. Drop it and let the backoff loop
+                    # re-establish a fresh connection instead of hanging.
+                    if self._awaiting_pong and (now - self._last_recv_time) >= self._pong_deadline:
+                        self.logger.log_service(
+                            "WARN",
+                            f"No data from IRC server for {int(now - self._last_recv_time)}s "
+                            f"after PING; treating link as dead."
+                        )
+                        self._disconnect(reason=(
+                            "Timeout: server tidak merespons PING "
+                            f"(> {int(self._pong_deadline)}s tanpa data)."
+                        ))
+                        continue
+
+                    # Otherwise just refresh the keepalive PING.
+                    if now - self._last_ping_sent >= self._ping_interval:
+                        self._send_raw(f"PING :{self.config.irc.server}")
+                        self._last_ping_sent = now
+                        self._awaiting_pong = True
                     continue
                 self.logger.log_service("WARN", f"IRC socket read error: {e}")
                 self._disconnect(reason=f"Kesalahan socket IRC: {e}")

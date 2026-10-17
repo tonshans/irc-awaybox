@@ -64,3 +64,15 @@ max_delay_seconds = 300
 
 # Exponential backoff multiplier
 backoff_multiplier = 2.0
+
+# Keepalive tuning (prevents idle-timeout disconnects from IRC servers)
+# Socket read wake-up interval in seconds
+read_timeout_seconds = 60
+
+# How often the bot proactively sends its own PING when idle (seconds).
+# Must be below the server's idle timeout (Libera: ~120s; many nets: 300s).
+ping_interval_seconds = 45
+
+# If the server sends nothing for this long after our PING, the link is
+# declared dead and a fresh reconnect is started (seconds).
+pong_deadline_seconds = 150
