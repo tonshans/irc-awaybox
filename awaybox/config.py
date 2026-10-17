@@ -19,6 +19,39 @@ class ConfigError(Exception):
     pass
 
 
+def _to_int(value: Any, name: str) -> int:
+    """Converts a config value to int, raising ConfigError on garbage input.
+
+    A bare ``int(...)`` in load_config let non-numeric values (e.g.
+    ``port = "6697a"``) crash the app with an uncaught ValueError traceback
+    instead of the friendly ConfigError message main() handles (bug #9 fix).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"Invalid integer for {name}: {value!r}. Must be a whole number.")
+
+
+def _strip_inline_comment(raw_val: str) -> str:
+    """Removes a trailing ``# comment`` from a raw fallback-TOML value.
+
+    For quoted strings, only a '#' occurring AFTER the closing quote counts
+    as a comment; a '#' inside the string stays literal. The old naive
+    ``split('#')`` turned ``message = "hi # there" # tail`` into the broken
+    fragment ``'"hi'`` (bug #8 fix)."""
+    if "#" not in raw_val:
+        return raw_val
+    if raw_val.startswith('"') or raw_val.startswith("'"):
+        quote = raw_val[0]
+        end = raw_val.find(quote, 1)
+        if end != -1:
+            after = raw_val[end + 1:]
+            if "#" in after:
+                return raw_val[:end + 1] + after.split("#", 1)[0].rstrip()
+            return raw_val
+    return raw_val.split("#", 1)[0].strip()
+
+
 def parse_simple_toml(content: str) -> Dict[str, Any]:
     """
     Lightweight fallback TOML parser for standard AwayBox config files.
@@ -46,9 +79,8 @@ def parse_simple_toml(content: str) -> Dict[str, Any]:
             key = parts[0].strip()
             raw_val = parts[1].strip()
 
-            # Inline comments strip (unless inside quotes)
-            if not (raw_val.startswith('"') and raw_val.endswith('"')) and "#" in raw_val:
-                raw_val = raw_val.split("#", 1)[0].strip()
+            # Inline comments strip (quote-aware, bug #8 fix)
+            raw_val = _strip_inline_comment(raw_val)
 
             val: Any = raw_val
             # Parse booleans
@@ -241,7 +273,7 @@ def load_config(
     irc_sec = raw_cfg.get("irc", {})
     irc_cfg = IRCConfig(
         server=irc_sec.get("server", "irc.libera.chat"),
-        port=int(irc_sec.get("port", 6697)),
+        port=_to_int(irc_sec.get("port", 6697), "irc.port"),
         tls=bool(irc_sec.get("tls", True)),
         nick=str(irc_sec.get("nick", "AwayBox")),
         username=str(irc_sec.get("username", "awaybox")),
@@ -260,21 +292,21 @@ def load_config(
         enabled=bool(auto_sec.get("enabled", True)),
         message=str(auto_sec.get("message", "I am currently away. Your message has been recorded.")),
         default_channels=list(auto_sec.get("default_channels", [])),
-        cooldown_seconds=int(auto_sec.get("cooldown_seconds", 300)),
+        cooldown_seconds=_to_int(auto_sec.get("cooldown_seconds", 300), "autoreply.cooldown_seconds"),
     )
 
     # 5. Parse Telegram Section
     tg_sec = raw_cfg.get("telegram", {})
     raw_uid = env_user_id or tg_sec.get("allowed_user_id", 0)
     try:
-        allowed_user_id = int(raw_uid)
+        allowed_user_id = _to_int(raw_uid, "telegram.allowed_user_id")
     except (ValueError, TypeError):
         allowed_user_id = 0
 
     tg_cfg = TelegramConfig(
         allowed_user_id=allowed_user_id,
-        reply_session_timeout_seconds=int(tg_sec.get("reply_session_timeout_seconds", 120)),
-        log_max_lines=int(tg_sec.get("log_max_lines", 20)),
+        reply_session_timeout_seconds=_to_int(tg_sec.get("reply_session_timeout_seconds", 120), "telegram.reply_session_timeout_seconds"),
+        log_max_lines=_to_int(tg_sec.get("log_max_lines", 20), "telegram.log_max_lines"),
     )
 
     # 6. Parse Logging Section
@@ -286,8 +318,8 @@ def load_config(
     # 7. Parse Reconnect Section
     rec_sec = raw_cfg.get("reconnect", {})
     rec_cfg = ReconnectConfig(
-        initial_delay_seconds=int(rec_sec.get("initial_delay_seconds", 5)),
-        max_delay_seconds=int(rec_sec.get("max_delay_seconds", 300)),
+        initial_delay_seconds=_to_int(rec_sec.get("initial_delay_seconds", 5), "reconnect.initial_delay_seconds"),
+        max_delay_seconds=_to_int(rec_sec.get("max_delay_seconds", 300), "reconnect.max_delay_seconds"),
         backoff_multiplier=float(rec_sec.get("backoff_multiplier", 2.0)),
         read_timeout_seconds=float(rec_sec.get("read_timeout_seconds", 60.0)),
         ping_interval_seconds=float(rec_sec.get("ping_interval_seconds", 45.0)),

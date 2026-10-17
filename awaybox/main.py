@@ -69,11 +69,13 @@ class AwayBoxApp:
     def on_irc_disconnected(self, reason: str) -> None:
         """Alerts the owner via Telegram when the IRC link drops.
 
-        Deduplicated through RuntimeState so a long outage with repeated
-        backoff failures produces exactly one alert until reconnection.
+        Deduplication is owned by the caller (IRCClient): the loop claims the
+        flag through ``RuntimeState.should_send_disconnect_alert()`` before
+        invoking this handler. Re-checking that atomic check-and-set flag here
+        would always see "already sent" and silently drop every alert — most
+        visibly the "connection failed" alert during a full server outage
+        (bug #1 fix).
         """
-        if not self.state.should_send_disconnect_alert():
-            return
         self.logger.log_service("WARN", f"IRC disconnected: {reason}")
         if self.state.telegram_active:
             try:

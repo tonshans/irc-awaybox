@@ -332,7 +332,7 @@ class IRCClient:
             self._awaiting_pong = False
 
             # Handshake: NICK and USER. Reset the active-nick tracker on every
-            (re)connection attempt; a later 433 switches it to the fallback.
+            # (re)connection attempt; a later 433 switches it to the fallback.
             self._active_nick = cfg.nick
             self._send_raw(f"NICK {cfg.nick}")
             self._send_raw(f"USER {cfg.username} 0 * :{cfg.realname}")
@@ -356,6 +356,11 @@ class IRCClient:
         Telegram. Graceful shutdowns never trigger alerts.
         """
         was_connected = self._connected
+        if was_connected:
+            # Record the outage moment for every drop path (not just failed
+            # connect attempts) so the Telegram alert shows a real "N detik
+            # lalu" instead of always claiming "baru saja" (bug #11 fix).
+            self.state.last_disconnect_time = time.time()
         self._connected = False
         self.state.irc_connected = False
         self.state.irc_authenticated = False
@@ -425,6 +430,10 @@ class IRCClient:
         if msg.command == "433":
             alt_nick = f"{self.config.irc.nick}_"
             self.logger.log_service("WARN", f"Nickname in use, retrying with {alt_nick}...")
+            # Track the fallback as our ACTIVE nick so echo filtering and
+            # logging compare against what is really registered on the
+            # network, not the config default (bug #2 fix).
+            self._active_nick = alt_nick
             self._send_raw(f"NICK {alt_nick}")
             return
 
@@ -493,6 +502,10 @@ class IRCClient:
                         "WARN",
                         f"Reconnecting in {int(delay)}s (attempt {self.state.reconnect_attempts})..."
                     )
+                    # Claim the dedup flag HERE only (atomic check-and-set) and
+                    # dispatch unconditionally. The app handler must not re-check
+                    # the same flag, or every "connection failed" alert would be
+                    # silently dropped (bug #1 fix).
                     if self.state.should_send_disconnect_alert():
                         self._fire_disconnect_alert(
                             f"Gagal terhubung ke IRC server {self.config.irc.server}:{self.config.irc.port}."
