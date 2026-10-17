@@ -46,6 +46,23 @@ def is_valid_nick(nickname: str) -> bool:
     return bool(_NICK_RE.fullmatch(nickname))
 
 
+def html_escape(text: str) -> str:
+    """Escapes text for Telegram's HTML parse mode.
+
+    All attacker-/server-controlled strings (IRC nicknames, message bodies,
+    log lines, disconnect reasons) MUST pass through this before being
+    embedded in messages sent with parse_mode="HTML", otherwise raw markup
+    like "<b>" or malformed entities makes sendMessage fail and the
+    notification is silently lost (bugs #3 & #4 fix).
+    """
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class TelegramBot:
     def __init__(
         self,
@@ -169,18 +186,18 @@ class TelegramBot:
         Sends Telegram notification for incoming channel message with buttons:
         [Reply Channel] [Private <sender>]
         """
-        clean_text = text[:500]
-        msg = f"<b>[{channel}]</b> &lt;{sender}&gt;: {clean_text}"
+        clean_text = html_escape(text[:500])
+        msg = f"<b>[{html_escape(channel)}]</b> &lt;{html_escape(sender)}&gt;: {clean_text}"
 
         keyboard = {
             "inline_keyboard": [
                 [
                     {
-                        "text": f"Reply {channel}",
+                        "text": f"Reply {channel}"[:64],
                         "callback_data": f"reply:channel:{channel}",
                     },
                     {
-                        "text": f"Private {sender}",
+                        "text": f"Private {sender}"[:64],
                         "callback_data": f"reply:private:{sender}",
                     },
                 ]
@@ -193,14 +210,14 @@ class TelegramBot:
         Sends Telegram notification for incoming PM with button:
         [Reply <sender>]
         """
-        clean_text = text[:500]
-        msg = f"<b>[PM]</b> &lt;{sender}&gt;: {clean_text}"
+        clean_text = html_escape(text[:500])
+        msg = f"<b>[PM]</b> &lt;{html_escape(sender)}&gt;: {clean_text}"
 
         keyboard = {
             "inline_keyboard": [
                 [
                     {
-                        "text": f"Reply {sender}",
+                        "text": f"Reply {sender}"[:64],
                         "callback_data": f"reply:private:{sender}",
                     }
                 ]
@@ -226,7 +243,7 @@ class TelegramBot:
             f"• Nick: {self.config.irc.nick}\n"
             f"• Waktu: {when}\n"
             f"• Percobaan ulang saat ini: {self.state.reconnect_attempts}\n"
-            f"• Alasan: {reason[:300]}\n\n"
+            f"• Alasan: {html_escape(reason[:300])}\n\n"
             f"Pilih tindakan:\n"
             f"🔄 <i>Reconnect</i> — coba sambungkan kembali sekarang.\n"
             f"⏸️ <i>Jangan Reconnect</i> — hentikan percobaan otomatis sampai Anda memerintahkan /reconnect."
@@ -252,13 +269,20 @@ class TelegramBot:
         return self.send_message(msg, parse_mode="HTML")
 
     # ---- Reconnect Control Helpers ----
-    def trigger_reconnect(self) -> None:
-        """Requests an immediate IRC reconnect attempt (button / command)."""
+    def trigger_reconnect(self) -> bool:
+        """Requests an immediate IRC reconnect attempt (button / command).
+
+        Returns False when the owner has explicitly held the link closed via
+        /disconirc: in that state a manual reconnect must not silently
+        override the hold (bug #2 fix) — use /conirc to resume instead.
+        """
+        if self.state.owner_disconnect_requested:
+            return False
         self.state.set_auto_reconnect(True)
         if self.irc_reconnect:
-            self.irc_reconnect()
-        else:
-            self.state.request_manual_reconnect()
+            return bool(self.irc_reconnect())
+        self.state.request_manual_reconnect()
+        return True
 
     def halt_reconnect(self) -> None:
         """Pauses automatic reconnection until the owner manually resumes."""
@@ -560,7 +584,7 @@ class TelegramBot:
             buffered = self.state.pop_whois_buffer(requested)
             if buffered is not None:
                 body = "\n".join(buffered) if buffered else "(tidak ada detail dari server)"
-                return f"<b>WHOIS {target_nick}:</b>\n<pre>{body}</pre>"
+                return f"<b>WHOIS {html_escape(target_nick)}:</b>\n<pre>{html_escape(body)}</pre>"
 
             sent = False
             if self.irc_whois:
@@ -582,8 +606,8 @@ class TelegramBot:
             if not lines:
                 return f"Tidak ada riwayat log ditemukan untuk <code>{target}</code>."
             
-            header = f"<b>Cuplikan Log untuk {target} ({len(lines)} baris terakhir):</b>\n<pre>"
-            content = "\n".join(lines)
+            header = f"<b>Cuplikan Log untuk {html_escape(target)} ({len(lines)} baris terakhir):</b>\n<pre>"
+            content = html_escape("\n".join(lines))
             footer = "</pre>"
             # Telegram character limit check
             if len(header) + len(content) + len(footer) > 4000:
@@ -607,7 +631,13 @@ class TelegramBot:
             elif sub == "now":
                 if self.state.irc_connected:
                     return "ℹ️ Koneksi IRC saat ini sudah aktif. Tidak ada yang perlu disambungkan ulang."
-                self.trigger_reconnect()
+                if not self.trigger_reconnect():
+                    return (
+                        "⏸️ <b>Reconnect ditahan oleh /disconirc.</b>\n"
+                        "Bot sedang dalam mode offline atas perintah Anda sendiri, sehingga "
+                        "/reconnect tidak diizinkan menyambung kembali. "
+                        "Ketik /conirc untuk menghubungkan ke IRC lagi."
+                    )
                 return "🔄 Perintah reconnect diterima. Bot akan segera mencoba menyambung ke IRC..."
             else:
                 return "Opsi /reconnect tidak dikenal. Gunakan: now, auto, atau stop."
@@ -645,8 +675,10 @@ class TelegramBot:
         buffered = self.state.pop_whois_buffer(target_nick) or []
         body = "\n".join(buffered) if buffered else "(tidak ada detail dari server)"
         try:
+            # Server-controlled WHOIS text must be HTML-escaped or a nickname/
+            # realname containing markup breaks sendMessage (bug #4 fix).
             self.send_message(
-                f"<b>WHOIS {target_nick}:</b>\n<pre>{body}</pre>",
+                f"<b>WHOIS {html_escape(target_nick)}:</b>\n<pre>{html_escape(body)}</pre>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -672,7 +704,15 @@ class TelegramBot:
         if data.startswith("reconnect:"):
             choice = data.split(":", 1)[1] if ":" in data else ""
             if choice == "yes":
-                self.trigger_reconnect()
+                if not self.trigger_reconnect():
+                    self.answer_callback(cb_id, text="Ditahan oleh /disconirc.")
+                    self.send_message(
+                        "⏸️ <b>Reconnect ditahan oleh /disconirc.</b>\n"
+                        "Bot dalam mode offline atas perintah Anda. "
+                        "Ketik /conirc untuk menghubungkan ke IRC lagi.",
+                        parse_mode="HTML",
+                    )
+                    return
                 self.answer_callback(cb_id, text="Reconnect dimulai...")
                 self.send_message(
                     "🔄 <b>Reconnect diminta.</b>\n"
@@ -727,7 +767,10 @@ class TelegramBot:
         if clean.startswith("/"):
             reply = self.handle_command(clean)
             if reply:
-                self.send_message(reply, parse_mode="HTML")
+                # User-supplied arguments inside the reply are raw; escape them
+                # so HTML parse mode never fails on markup typed by the owner
+                # (e.g. "/join <test>", "/ignore <b>x</b>") — bug #3 fix.
+                self.send_message(html_escape(reply), parse_mode="HTML")
             return
 
         # 2. Regular text message -> check active reply session

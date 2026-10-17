@@ -210,11 +210,18 @@ class IRCClient:
         """Drops the current link (if any) and requests an immediate reconnect.
 
         Used by the Telegram /reconnect command and the inline Reconnect button.
+        Respects the /disconirc hold: while the owner has explicitly kept the
+        link closed, a manual reconnect must NOT silently override that choice
+        (bug #2 fix) — the caller reports this to the user instead.
+        Returns True when the reconnect was initiated, False when held.
         """
+        if self.state.owner_disconnect_requested:
+            return False
         self.state.request_manual_reconnect()
         if self._connected:
             self.logger.log_service("INFO", "Forcing disconnect for immediate manual reconnect...")
             self._disconnect(reason="Reconnect manual diminta dari Telegram.")
+        return True
 
     def connect_now(self) -> bool:
         """Connects to IRC immediately from Telegram (/conirc).
@@ -478,24 +485,44 @@ class IRCClient:
                     self._disconnect(reason="Server IRC menutup koneksi (socket closed by remote).")
                     continue
 
-                now = time.monotonic()
-                self._last_recv_time = now
-                # Any traffic from the server proves the link is alive;
-                # clear the pending PING state.
-                self._awaiting_pong = False
-
                 buffer += chunk.decode("utf-8", errors="replace")
+                # Parse this chunk's complete lines, remembering which of them
+                # were server-originated (non-numeric) traffic.
+                chunk_lines: List[str] = []
                 while "\r\n" in buffer:
                     line, buffer = buffer.split("\r\n", 1)
                     if line:
-                        self._process_line(line)
+                        chunk_lines.append(line)
+
+                live_traffic = False
+                for ln in chunk_lines:
+                    if not IRCMessage(ln).command.isdigit():
+                        live_traffic = True
+                    self._process_line(ln)
+
+                # Keepalive bookkeeping runs AFTER the lines are parsed so a
+                # PONG arriving in this same chunk is correctly recognized.
+                # Only server-originated (non-numeric) traffic — PRIVMSG,
+                # NOTICE, server PING, JOIN, ... — proves the link is alive.
+                # Numeric replies merely answer our own queries; a half-open
+                # link can still deliver stale queued numerics, so they must
+                # never reset the dead-link timer (bug #1 fix).
+                if live_traffic:
+                    self._last_recv_time = time.monotonic()
+                    self._awaiting_pong = False
+                else:
+                    # No live evidence yet: if we already have an outstanding
+                    # PING, give its reply one more read cycle before the
+                    # deadline check below declares the link dead.
+                    if self._awaiting_pong:
+                        continue
 
                 # Proactive keepalive: if the link has been idle past the
                 # ping interval, send our own PING so neither we nor the
                 # server ever considers the connection stale.
-                if now - self._last_ping_sent >= self._ping_interval:
+                if time.monotonic() - self._last_ping_sent >= self._ping_interval:
                     self._send_raw(f"PING :{self.config.irc.server}")
-                    self._last_ping_sent = now
+                    self._last_ping_sent = time.monotonic()
                     self._awaiting_pong = True
             except (socket.timeout, ssl.SSLError) as e:
                 # Idle socket read timeout: this is EXPECTED every
