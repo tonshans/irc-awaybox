@@ -18,11 +18,19 @@ from typing import Dict, Iterable, List, Optional, Set
 from awaybox.config import AppConfig
 
 
+# Maximum lifetime (seconds) of an incomplete pending WHOIS buffer. If the
+# server never sends RPL_ENDOFWHOIS (e.g. the link dropped mid-reply), the
+# stale buffer is swept away so a follow-up /whois can re-request instead of
+# reporting "still processing" forever (bug #3 fix).
+WHOIS_PENDING_TIMEOUT_SECONDS = 60.0
+
+
 @dataclass
 class _WhoisBuffer:
     """A pending WHOIS reply buffer for one nickname."""
     lines: List[str] = field(default_factory=list)
     completed: bool = False  # True once the server sent RPL_ENDOFWHOIS
+    created_at: float = field(default_factory=time.time)  # for staleness sweep
 
 
 class RuntimeState:
@@ -86,6 +94,18 @@ class RuntimeState:
                 return False
             self.disconnect_notified = True
             return True
+
+    def disconnect_alert_pending(self) -> bool:
+        """Non-destructive check: True when an alert has NOT been sent yet.
+
+        Used by callers that must claim the flag themselves via
+        ``should_send_disconnect_alert()`` after actually dispatching the
+        alert. Checking the same atomic flag twice (pre-check in the IRC
+        loop + re-check in the app handler) would silently drop every
+        "connection failed" alert (bug #1 fix).
+        """
+        with self._reconnect_lock:
+            return not self.disconnect_notified
 
     def clear_disconnect_alert(self) -> None:
         """Resets the disconnect alert flag after successful reconnection."""
@@ -263,12 +283,31 @@ class RuntimeState:
         return max(0, int(remaining))
 
     # ---- Pending WHOIS Buffers ----
+    def _sweep_stale_whois(self, now: Optional[float] = None) -> None:
+        """Drops incomplete WHOIS buffers older than WHOIS_PENDING_TIMEOUT_SECONDS.
+
+        If the IRC link drops before RPL_ENDOFWHOIS arrives, the buffer would
+        otherwise linger forever and every later /whois for that nick would
+        answer "still processing" without ever re-requesting (bug #3 fix).
+        Completed buffers are never swept here: they are cached results meant
+        to be delivered by a follow-up /whois.
+        """
+        curr = now if now is not None else time.time()
+        stale = [
+            key for key, buf in self._pending_whois.items()
+            if not buf.completed and (curr - buf.created_at) > WHOIS_PENDING_TIMEOUT_SECONDS
+        ]
+        for key in stale:
+            self._pending_whois.pop(key, None)
+
     @property
     def pending_whois(self) -> Dict[str, List[str]]:
+        self._sweep_stale_whois()
         return {k: list(v.lines) for k, v in self._pending_whois.items()}
 
     def has_pending_whois(self, nickname: str) -> bool:
         """Returns True if a pending WHOIS buffer exists for the nickname (case-insensitive)."""
+        self._sweep_stale_whois()
         if not nickname:
             return False
         return nickname.strip().lower() in self._pending_whois

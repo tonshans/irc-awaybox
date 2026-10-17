@@ -35,9 +35,13 @@ from awaybox.state import RuntimeState
 _NICK_RE = re.compile(r"[A-Za-z0-9_\\{}\^|`~-]{1,30}")
 
 # Numeric WHOIS reply codes whose target nickname lives in params[1].
+# Single source of truth: awaybox/irc_client.py imports this constant instead
+# of keeping a second copy that can silently drift out of sync (bug #4 fix).
+# RPL_AWAY (301) was missing here, so "away message" lines from WHOIS replies
+# were dropped before reaching Telegram.
 _WHOIS_RPL_CODES = frozenset(
     "250 251 252 253 254 255 256 257 258 259 260 261 262 265 276 278 "
-    "307 311 312 313 317 318 319 320 321 323 330 335 337 338 340 378 379 402".split()
+    "301 307 311 312 313 317 318 319 320 321 323 330 335 337 338 340 378 379 402".split()
 )
 
 
@@ -74,7 +78,7 @@ class TelegramBot:
         irc_join_func: Optional[Callable[[str], bool]] = None,
         irc_leave_func: Optional[Callable[[str], bool]] = None,
         irc_whois_func: Optional[Callable[[str], bool]] = None,
-        irc_reconnect_func: Optional[Callable[[], None]] = None,
+        irc_reconnect_func: Optional[Callable[[], bool]] = None,
         irc_connect_func: Optional[Callable[[], bool]] = None,
         irc_disconnect_func: Optional[Callable[[], bool]] = None,
     ) -> None:
@@ -152,6 +156,51 @@ class TelegramBot:
             return None
 
     # ---- Sending Messages & Notifications ----
+    @staticmethod
+    def _truncate_html(text: str, limit: int = 4000) -> str:
+        """Truncates text to `limit` characters WITHOUT breaking HTML markup.
+
+        A naive ``text[:4000]`` after the markup was built can cut in the middle
+        of a long message and drop the closing tag (e.g. ``</pre>``), which makes
+        Telegram reject the send with error 400 and silently lose the whole
+        notification (bug #5 fix). This helper truncates the plain content and
+        re-appends any unbalanced closing tags.
+        """
+        if len(text) <= limit:
+            return text
+
+        # Find the last '>' at or before the limit that is NOT part of an
+        # escaped entity (&amp; &lt; &gt;) so we never split a tag or entity.
+        cut = -1
+        i = limit
+        while i >= 0:
+            j = text.rfind(">", 0, i + 1)
+            if j == -1:
+                break
+            k = text.rfind("&", 0, j)
+            if k != -1 and (j - k) <= 5 and text[k:j + 1] in ("&amp;", "&lt;", "&gt;"):
+                i = k - 1
+                continue
+            cut = j + 1
+            break
+        if cut <= 0:
+            cut = limit
+
+        truncated = text[:cut]
+        # Re-close any block tags left open by the cut, innermost first.
+        closers = []
+        for tag in ("code", "i", "b", "pre"):
+            opens = len(re.findall(rf"<{tag}(?=>|\s)", truncated))
+            closes = len(re.findall(rf"</{tag}>", truncated))
+            if opens > closes:
+                closers.append(f"</{tag}>")
+        # Nesting order: <pre> wraps <code>/<b>/<i>, so close inner tags first.
+        suffix = "".join(
+            c for tag in ("i", "code", "b", "pre")
+            for c in closers if c == f"</{tag}>"
+        )
+        return truncated + suffix + "\n… (dipotong)"
+
     def send_message(
         self,
         text: str,
@@ -164,7 +213,9 @@ class TelegramBot:
 
         payload: Dict[str, Any] = {
             "chat_id": self.allowed_user_id,
-            "text": text[:4000],  # Telegram message size safety
+            # Markup-aware truncation: never cut inside a tag/entity so long
+            # WHOIS/log messages still parse correctly on Telegram (bug #5).
+            "text": self._truncate_html(text) if parse_mode == "HTML" else text[:4000],
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -348,6 +399,10 @@ class TelegramBot:
 
         cmd = parts[0].lower().split("@")[0]  # strip @botname if present
         args = parts[1:]
+        # Replies are sent with parse_mode="HTML" and contain our own markup,
+        # so raw user-supplied tokens must be escaped HERE (at the source),
+        # never by double-escaping the whole finished reply (bug #6 fix).
+        safe_args = [html_escape(a) for a in args]
 
         if cmd == "/start":
             return (
@@ -424,7 +479,7 @@ class TelegramBot:
                 if not self.state.has_channel(target):
                     return (
                         f"AwayBox belum berada di channel <code>{target}</code>.\n"
-                        f"Gunakan /join {target} terlebih dahulu."
+                        f"Gunakan /join {safe_args[0]} terlebih dahulu."
                     )
             else:
                 # Validate nickname format
@@ -439,7 +494,7 @@ class TelegramBot:
                 sent = self.irc_send(target, message)
 
             if not sent:
-                return f"⚠️ Gagal mengirim pesan ke <code>{target}</code> melalui IRC."
+                return f"⚠️ Gagal mengirim pesan ke <code>{safe_args[0]}</code> melalui IRC."
 
             # Log as OUT message
             if is_channel:
@@ -447,7 +502,7 @@ class TelegramBot:
             else:
                 self.logger.log_private_outgoing(target, self.config.irc.nick, message)
 
-            return f"✅ Pesan berhasil dikirim ke <code>{target}</code> di IRC."
+            return f"✅ Pesan berhasil dikirim ke <code>{safe_args[0]}</code> di IRC."
 
         elif cmd == "/join":
             if not args:
@@ -466,9 +521,14 @@ class TelegramBot:
                 joined = self.state.add_channel(target_ch)
 
             if joined:
-                return f"Meminta AwayBox bergabung ke <code>{target_ch}</code>."
+                if not self.state.irc_connected:
+                    return (
+                        f"📌 IRC sedang terputus: <code>{safe_args[0]}</code> "
+                        f"dicatat dan akan otomatis di-JOIN saat koneksi pulih."
+                    )
+                return f"Meminta AwayBox bergabung ke <code>{safe_args[0]}</code>."
             return (
-                f"⚠️ Gagal bergabung ke <code>{target_ch}</code>: "
+                f"⚠️ Gagal bergabung ke <code>{safe_args[0]}</code>: "
                 f"koneksi IRC sedang terputus atau channel sudah aktif."
             )
 
@@ -477,7 +537,7 @@ class TelegramBot:
                 return "Gunakan: /leave #channel"
             target_ch = args[0]
             if not self.state.has_channel(target_ch):
-                return f"AwayBox tidak berada di channel <code>{target_ch}</code>."
+                return f"AwayBox tidak berada di channel <code>{safe_args[0]}</code>."
 
             # Resolve the exact case as tracked in runtime state for a reliable PART
             resolved = target_ch
@@ -493,8 +553,8 @@ class TelegramBot:
                 left = self.state.remove_channel(resolved)
 
             if left:
-                return f"Meminta AwayBox meninggalkan <code>{resolved}</code>."
-            return f"⚠️ Gagal meninggalkan <code>{resolved}</code>: koneksi IRC sedang terputus."
+                return f"Meminta AwayBox meninggalkan <code>{html_escape(resolved)}</code>."
+            return f"⚠️ Gagal meninggalkan <code>{html_escape(resolved)}</code>: koneksi IRC sedang terputus."
 
         elif cmd == "/autoreply":
             if not args:
@@ -503,7 +563,7 @@ class TelegramBot:
                 return (
                     f"<b>Pengaturan Auto-Reply:</b>\n"
                     f"• Status: {status}\n"
-                    f"• Pesan: \"{self.config.autoreply.message}\"\n"
+                    f"• Pesan: \"{html_escape(self.config.autoreply.message)}\"\n"
                     f"• Cooldown: {self.config.autoreply.cooldown_seconds} detik\n"
                     f"• Channel: {chs}\n\n"
                     f"Penggunaan: /autoreply [on | off | add #ch | remove #ch]"
@@ -521,13 +581,13 @@ class TelegramBot:
                     return "Gunakan: /autoreply add #channel"
                 ch = args[1]
                 added = self.state.add_autoreply_channel(ch)
-                return f"Channel <code>{ch}</code> {'ditambahkan ke' if added else 'sudah ada di'} daftar auto-reply."
+                return f"Channel <code>{safe_args[1]}</code> {'ditambahkan ke' if added else 'sudah ada di'} daftar auto-reply."
             elif sub == "remove":
                 if len(args) < 2:
                     return "Gunakan: /autoreply remove #channel"
                 ch = args[1]
                 removed = self.state.remove_autoreply_channel(ch)
-                return f"Channel <code>{ch}</code> {'dihapus dari' if removed else 'tidak ditemukan di'} daftar auto-reply."
+                return f"Channel <code>{safe_args[1]}</code> {'dihapus dari' if removed else 'tidak ditemukan di'} daftar auto-reply."
             else:
                 return "Opsi /autoreply tidak dikenal. Gunakan: on, off, add, atau remove."
 
@@ -542,8 +602,8 @@ class TelegramBot:
                 return "Nickname tidak valid."
             added = self.state.add_ignore(nick)
             if added:
-                return f"Nickname <code>{nick}</code> sekarang diabaikan (pesan tidak dicatat & tidak dinotifikasi)."
-            return f"Nickname <code>{nick}</code> sudah ada dalam ignore list."
+                return f"Nickname <code>{safe_args[0]}</code> sekarang diabaikan (pesan tidak dicatat & tidak dinotifikasi)."
+            return f"Nickname <code>{safe_args[0]}</code> sudah ada dalam ignore list."
 
         elif cmd == "/unignore":
             if not args:
@@ -551,8 +611,8 @@ class TelegramBot:
             nick = args[0]
             removed = self.state.remove_ignore(nick)
             if removed:
-                return f"Nickname <code>{nick}</code> dihapus dari ignore list."
-            return f"Nickname <code>{nick}</code> tidak ditemukan di ignore list."
+                return f"Nickname <code>{safe_args[0]}</code> dihapus dari ignore list."
+            return f"Nickname <code>{safe_args[0]}</code> tidak ditemukan di ignore list."
 
         elif cmd == "/whois":
             if not args:
@@ -577,7 +637,7 @@ class TelegramBot:
 
             # Reply still in transit: do not spam a duplicate WHOIS request.
             if self.state.has_pending_whois(requested):
-                return f"Hasil WHOIS untuk <code>{target_nick}</code> masih diproses, coba lagi sebentar."
+                return f"Hasil WHOIS untuk <code>{safe_args[0]}</code> masih diproses, coba lagi sebentar."
 
             # Already-completed reply waiting in the buffer (auto-delivery may have
             # failed while Telegram was down): deliver it now instead of re-requesting.
@@ -590,11 +650,11 @@ class TelegramBot:
             if self.irc_whois:
                 sent = bool(self.irc_whois(target_nick))
             if not sent:
-                return f"⚠️ Gagal meminta WHOIS untuk <code>{target_nick}</code>: koneksi IRC sedang terputus."
+                return f"⚠️ Gagal meminta WHOIS untuk <code>{safe_args[0]}</code>: koneksi IRC sedang terputus."
 
             self.state.register_whois(requested)
             return (
-                f"WHOIS untuk <code>{target_nick}</code> diminta. "
+                f"WHOIS untuk <code>{safe_args[0]}</code> diminta. "
                 f"Hasil akan dikirim otomatis begitu balasan server diterima."
             )
 
@@ -604,7 +664,7 @@ class TelegramBot:
             target = args[0]
             lines = self.logger.read_tail(target, max_lines=self.config.telegram.log_max_lines)
             if not lines:
-                return f"Tidak ada riwayat log ditemukan untuk <code>{target}</code>."
+                return f"Tidak ada riwayat log ditemukan untuk <code>{safe_args[0]}</code>."
             
             header = f"<b>Cuplikan Log untuk {html_escape(target)} ({len(lines)} baris terakhir):</b>\n<pre>"
             content = html_escape("\n".join(lines))
@@ -767,10 +827,11 @@ class TelegramBot:
         if clean.startswith("/"):
             reply = self.handle_command(clean)
             if reply:
-                # User-supplied arguments inside the reply are raw; escape them
-                # so HTML parse mode never fails on markup typed by the owner
-                # (e.g. "/join <test>", "/ignore <b>x</b>") — bug #3 fix.
-                self.send_message(html_escape(reply), parse_mode="HTML")
+                # handle_command returns its OWN trusted HTML markup (<b>,
+                # <code>, ...) and only escapes user-controlled fragments
+                # internally. Escaping the whole reply again would show raw
+                # tags like "<b>AwayBox Status</b>" to the owner (bug #6 fix).
+                self.send_message(reply, parse_mode="HTML")
             return
 
         # 2. Regular text message -> check active reply session

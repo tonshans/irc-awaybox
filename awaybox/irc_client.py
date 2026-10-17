@@ -29,12 +29,10 @@ from awaybox.config import AppConfig
 from awaybox.logger import AwayBoxLogger
 from awaybox.state import RuntimeState
 
-# Numeric WHOIS reply codes whose target nickname lives in params[1]
-# (kept in sync with awaybox.telegram_bot._WHOIS_RPL_CODES).
-_WHOIS_RPL_CODES = frozenset(
-    "250 251 252 253 254 255 256 257 258 259 260 261 262 265 276 278 "
-    "307 311 312 313 317 318 319 320 321 323 330 335 337 338 340 378 379 402".split()
-)
+# Numeric WHOIS reply codes whose target nickname lives in params[1].
+# Imported from telegram_bot as the single source of truth so the two modules
+# can never drift apart again (bug #4 fix). RPL_AWAY (301) is now included.
+from awaybox.telegram_bot import _WHOIS_RPL_CODES
 
 
 class IRCMessage:
@@ -123,6 +121,14 @@ class IRCClient:
         self._connected = False
         self._backoff = float(config.reconnect.initial_delay_seconds)
 
+        # Nickname actually in use on the network. Starts as the configured
+        # nick; switches to the fallback (e.g. "AwayBox_") when registration
+        # collides with ERR_NICKNAMEINUSE (433). Echo filtering and logging
+        # must compare against THIS value, not the config default, otherwise
+        # our own echoed messages get logged, notified and auto-replied to
+        # after a nick collision (bug #2 fix).
+        self._active_nick = config.irc.nick
+
         # --- Keepalive / timeout hardening -----------------------------------
         # Read timeout on the socket: short enough to notice dead/half-open
         # links quickly, long enough that normal traffic keeps us awake.
@@ -135,6 +141,11 @@ class IRCClient:
         self._last_recv_time = 0.0
         self._last_ping_sent = 0.0
         self._awaiting_pong = False
+
+    @property
+    def active_nick(self) -> str:
+        """The nickname currently used on IRC (may differ from config after 433)."""
+        return self._active_nick
 
     @property
     def is_connected(self) -> bool:
@@ -154,12 +165,19 @@ class IRCClient:
             self._thread.join(timeout=3.0)
 
     def _send_raw(self, line: str) -> bool:
-        """Sends a raw CRLF-terminated line to the IRC server."""
+        """Sends a raw CRLF-terminated line to the IRC server.
+
+        Any CR/LF embedded in the middle of the line is stripped first:
+        ``rstrip`` alone only trims trailing newlines, so an unsanitized value
+        (e.g. a config realname or channel name containing "\\r\\n") could be
+        split into two protocol lines — an IRC command injection (bug #7 fix).
+        """
         with self._lock:
             if not self._socket or not self._connected:
                 return False
             try:
-                data = (line.rstrip("\r\n") + "\r\n").encode("utf-8", errors="replace")
+                safe = line.replace("\r", " ").replace("\n", " ").rstrip()
+                data = (safe + "\r\n").encode("utf-8", errors="replace")
                 self._socket.sendall(data)
 
                 return True
@@ -187,7 +205,13 @@ class IRCClient:
         return self._send_raw(f"WHOIS {nick}")
 
     def join_channel(self, channel: str) -> bool:
-        """Sends JOIN command and tracks in runtime state."""
+        """Sends JOIN command and tracks in runtime state.
+
+        When offline the channel is still remembered in runtime state so it
+        will be joined automatically on the next successful registration; we
+        report success because the request IS honored (just deferred), instead
+        of silently mutating state while telling the owner it failed (bug #10).
+        """
         ch = channel.strip()
         if not ch.startswith("#") and not ch.startswith("&"):
             ch = f"#{ch}"
@@ -195,8 +219,7 @@ class IRCClient:
         if self.is_connected:
             self._send_raw(f"JOIN {ch}")
             self._apply_chanserv(ch)
-            return True
-        return False
+        return True
 
     def leave_channel(self, channel: str) -> bool:
         """Sends PART command and removes from runtime state."""
@@ -206,7 +229,7 @@ class IRCClient:
             return self._send_raw(f"PART {ch} :Leaving")
         return False
 
-    def force_reconnect(self) -> None:
+    def force_reconnect(self) -> bool:
         """Drops the current link (if any) and requests an immediate reconnect.
 
         Used by the Telegram /reconnect command and the inline Reconnect button.
@@ -308,7 +331,9 @@ class IRCClient:
             self._last_ping_sent = now
             self._awaiting_pong = False
 
-            # Handshake: NICK and USER
+            # Handshake: NICK and USER. Reset the active-nick tracker on every
+            (re)connection attempt; a later 433 switches it to the fallback.
+            self._active_nick = cfg.nick
             self._send_raw(f"NICK {cfg.nick}")
             self._send_raw(f"USER {cfg.username} 0 * :{cfg.realname}")
             return True
