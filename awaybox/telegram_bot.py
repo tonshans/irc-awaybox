@@ -5,7 +5,10 @@ Provides the remote control interface via Telegram Bot API using long polling:
 - Strict authorization check (numeric allowed_user_id only)
 - Interactive notifications with inline reply buttons
 - Reply session workflow management
-- Commands: /start, /status, /channels, /msg, /join, /leave, /autoreply, /ignore, /unignore, /log, /whois, /cancel
+- Commands: /start, /status, /channels, /msg, /join, /leave, /autoreply, /ignore, /unignore, /log, /whois, /reconnect, /conirc, /disconirc, /cancel
+- Disconnect alerts with inline choice buttons: Reconnect Sekarang / Jangan Reconnect
+- Manual link control from Telegram: /conirc connects (or reconnects) the bot
+  to IRC immediately; /disconirc disconnects and holds the link closed until /conirc
 - Fault isolation: Telegram outages do not crash IRC logging or connection
 """
 
@@ -54,6 +57,9 @@ class TelegramBot:
         irc_join_func: Optional[Callable[[str], bool]] = None,
         irc_leave_func: Optional[Callable[[str], bool]] = None,
         irc_whois_func: Optional[Callable[[str], bool]] = None,
+        irc_reconnect_func: Optional[Callable[[], None]] = None,
+        irc_connect_func: Optional[Callable[[], bool]] = None,
+        irc_disconnect_func: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -63,6 +69,9 @@ class TelegramBot:
         self.irc_join = irc_join_func
         self.irc_leave = irc_leave_func
         self.irc_whois = irc_whois_func
+        self.irc_reconnect = irc_reconnect_func
+        self.irc_connect = irc_connect_func
+        self.irc_disconnect = irc_disconnect_func
 
         self.token = config.telegram_bot_token or ""
         self.allowed_user_id = config.telegram.allowed_user_id
@@ -199,6 +208,109 @@ class TelegramBot:
         }
         return self.send_message(msg, reply_markup=keyboard, parse_mode="HTML")
 
+    def notify_disconnected(self, reason: str) -> bool:
+        """
+        Sends Telegram alert when the bot loses its IRC connection, with a
+        1-click choice: reconnect now or pause auto-reconnect entirely.
+        Buttons: [🔄 Reconnect Sekarang] [⏸️ Jangan Reconnect]
+        """
+        if self.state.last_disconnect_time:
+            ago = int(time.time() - self.state.last_disconnect_time)
+            when = f"{ago} detik lalu"
+        else:
+            when = "baru saja"
+
+        msg = (
+            f"🔌 <b>PERHATIAN: Koneksi IRC Terputus!</b>\n\n"
+            f"• Server: {self.config.irc.server}:{self.config.irc.port}\n"
+            f"• Nick: {self.config.irc.nick}\n"
+            f"• Waktu: {when}\n"
+            f"• Percobaan ulang saat ini: {self.state.reconnect_attempts}\n"
+            f"• Alasan: {reason[:300]}\n\n"
+            f"Pilih tindakan:\n"
+            f"🔄 <i>Reconnect</i> — coba sambungkan kembali sekarang.\n"
+            f"⏸️ <i>Jangan Reconnect</i> — hentikan percobaan otomatis sampai Anda memerintahkan /reconnect."
+        )
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 Reconnect Sekarang", "callback_data": "reconnect:yes"},
+                    {"text": "⏸️ Jangan Reconnect", "callback_data": "reconnect:no"},
+                ]
+            ]
+        }
+        return self.send_message(msg, reply_markup=keyboard, parse_mode="HTML")
+
+    def notify_reconnected(self) -> bool:
+        """Sends Telegram confirmation once the IRC connection is restored."""
+        msg = (
+            f"✅ <b>Koneksi IRC Pulih!</b>\n"
+            f"Bot berhasil tersambung kembali ke {self.config.irc.server} "
+            f"sebagai {self.config.irc.nick}."
+        )
+        return self.send_message(msg, parse_mode="HTML")
+
+    # ---- Reconnect Control Helpers ----
+    def trigger_reconnect(self) -> None:
+        """Requests an immediate IRC reconnect attempt (button / command)."""
+        self.state.set_auto_reconnect(True)
+        if self.irc_reconnect:
+            self.irc_reconnect()
+        else:
+            self.state.request_manual_reconnect()
+
+    def halt_reconnect(self) -> None:
+        """Pauses automatic reconnection until the owner manually resumes."""
+        self.state.set_auto_reconnect(False)
+
+    # ---- Manual Connect / Disconnect Control (/conirc & /disconirc) ----
+    def connect_irc(self) -> str:
+        """Connects (or reconnects) the bot to IRC immediately via /conirc."""
+        if self.irc_connect:
+            initiated = bool(self.irc_connect())
+        else:
+            # Fallback when no direct connect hook is wired: use state flags.
+            self.state.request_owner_connect()
+            initiated = True
+
+        if not initiated:
+            return "⚠️ Gagal: perintah IRC client tidak dapat dijalankan saat ini."
+
+        if self.state.irc_connected:
+            return (
+                "🔄 <b>Sambungan ulang IRC diminta.</b>\n"
+                "Bot sedang menyambung ulang ke server IRC sekarang."
+            )
+        return (
+            "🔗 <b>Koneksi IRC diminta.</b>\n"
+            f"Bot akan segera mencoba menyambung ke {self.config.irc.server}:{self.config.irc.port} "
+            f"sebagai {self.config.irc.nick}. Anda akan dinotifikasi ketika berhasil."
+        )
+
+    def disconnect_irc(self) -> str:
+        """Disconnects the bot from IRC on demand via /disconirc.
+
+        The link stays closed (no auto-reconnect, no retry attempts) until the
+        owner issues /conirc again.
+        """
+        was_connected: Optional[bool] = None
+        if self.irc_disconnect:
+            was_connected = bool(self.irc_disconnect())
+        else:
+            # Fallback when no direct disconnect hook is wired.
+            self.state.request_owner_disconnect()
+
+        if was_connected is False:
+            return (
+                "ℹ️ Koneksi IRC sudah terputus. Bot tetap offline sampai Anda mengetik /conirc."
+            )
+        return (
+            "🔌 <b>Koneksi IRC diputus.</b>\n"
+            "Bot mengirim QUIT dan menutup koneksi. Tidak ada percobaan sambung otomatis; "
+            "ketik /conirc kapan saja untuk menghubungkan kembali."
+        )
+
     # ---- Authorization Check ----
     def is_authorized(self, user_id: int) -> bool:
         """Strict check against single configured Telegram numeric user ID."""
@@ -227,6 +339,9 @@ class TelegramBot:
                 "/unignore Nick - Hapus dari ignore list\n"
                 "/whois Nick - Informasi user IRC (realname, server, channels)\n"
                 "/log [#ch|Nick] - Ambil cuplikan riwayat pesan\n"
+                "/reconnect [auto|now|stop] - Kontrol reconnect IRC dari Telegram\n"
+                "/conirc - Hubungkan koneksi bot ke IRC sekarang\n"
+                "/disconirc - Putuskan koneksi bot dari IRC (tahan offline sampai /conirc)\n"
                 "/cancel - Batalkan sesi balasan aktif"
             )
 
@@ -259,7 +374,8 @@ class TelegramBot:
                 f"• Ignore List: {ignore_nicks}\n"
                 f"• Active Reply Session: {session_info}\n"
                 f"• Uptime: {hrs}h {mins}m\n"
-                f"• Reconnect Attempts: {self.state.reconnect_attempts}"
+                f"• Reconnect Attempts: {self.state.reconnect_attempts}\n"
+                f"• Auto-Reconnect: {'Enabled' if self.state.auto_reconnect_enabled else 'Paused (manual control)'}"
             )
 
         elif cmd == "/channels":
@@ -474,6 +590,34 @@ class TelegramBot:
                 content = content[-3500:]
             return f"{header}{content}{footer}"
 
+        elif cmd == "/reconnect":
+            sub = args[0].lower() if args else "now"
+            if sub in ("auto", "on"):
+                self.state.set_auto_reconnect(True)
+                return (
+                    "▶️ Reconnect otomatis <b>diaktifkan</b>. "
+                    "Bot akan mencoba sambung kembali dengan backoff eksponensial."
+                )
+            elif sub in ("stop", "off", "no"):
+                self.halt_reconnect()
+                return (
+                    "⏸️ Reconnect <b>dihentikan</b>. Bot tidak akan mencoba menyambung "
+                    "kembali sampai Anda mengetik /reconnect now atau menekan tombol 🔄 Reconnect."
+                )
+            elif sub == "now":
+                if self.state.irc_connected:
+                    return "ℹ️ Koneksi IRC saat ini sudah aktif. Tidak ada yang perlu disambungkan ulang."
+                self.trigger_reconnect()
+                return "🔄 Perintah reconnect diterima. Bot akan segera mencoba menyambung ke IRC..."
+            else:
+                return "Opsi /reconnect tidak dikenal. Gunakan: now, auto, atau stop."
+
+        elif cmd == "/conirc":
+            return self.connect_irc()
+
+        elif cmd == "/disconirc":
+            return self.disconnect_irc()
+
         elif cmd == "/cancel":
             cancelled = self.reply_manager.cancel_session()
             if cancelled:
@@ -523,6 +667,31 @@ class TelegramBot:
             return
 
         data = cb.get("data", "")
+
+        # format: reconnect:<yes|no> - response to the disconnect alert buttons
+        if data.startswith("reconnect:"):
+            choice = data.split(":", 1)[1] if ":" in data else ""
+            if choice == "yes":
+                self.trigger_reconnect()
+                self.answer_callback(cb_id, text="Reconnect dimulai...")
+                self.send_message(
+                    "🔄 <b>Reconnect diminta.</b>\n"
+                    "Bot akan segera mencoba menyambung kembali ke IRC server.",
+                    parse_mode="HTML",
+                )
+            elif choice == "no":
+                self.halt_reconnect()
+                self.answer_callback(cb_id, text="Auto-reconnect dihentikan.")
+                self.send_message(
+                    "⏸️ <b>Auto-reconnect dihentikan.</b>\n"
+                    "Bot tetap offline di IRC sampai Anda mengetik /reconnect now "
+                    "atau menekan tombol 🔄 Reconnect Sekarang pada notifikasi terputus berikutnya.",
+                    parse_mode="HTML",
+                )
+            else:
+                self.answer_callback(cb_id)
+            return
+
         # format: reply:<type>:<target>
         if data.startswith("reply:"):
             parts = data.split(":", 2)

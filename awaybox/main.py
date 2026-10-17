@@ -45,6 +45,8 @@ class AwayBoxApp:
             logger=self.logger,
             on_message_callback=self.on_irc_message_received,
             on_whois_reply_callback=self.on_whois_reply,
+            on_disconnect_callback=self.on_irc_disconnected,
+            on_reconnect_callback=self.on_irc_reconnected,
         )
 
         # 3. Telegram Bot
@@ -57,9 +59,36 @@ class AwayBoxApp:
             irc_join_func=self.irc_client.join_channel,
             irc_leave_func=self.irc_client.leave_channel,
             irc_whois_func=self.irc_client.send_whois,
+            irc_reconnect_func=self.irc_client.force_reconnect,
+            irc_connect_func=self.irc_client.connect_now,
+            irc_disconnect_func=self.irc_client.disconnect,
         )
 
         self._running = False
+
+    def on_irc_disconnected(self, reason: str) -> None:
+        """Alerts the owner via Telegram when the IRC link drops.
+
+        Deduplicated through RuntimeState so a long outage with repeated
+        backoff failures produces exactly one alert until reconnection.
+        """
+        if not self.state.should_send_disconnect_alert():
+            return
+        self.logger.log_service("WARN", f"IRC disconnected: {reason}")
+        if self.state.telegram_active:
+            try:
+                self.telegram_bot.notify_disconnected(reason)
+            except Exception as e:
+                self.logger.log_service("WARN", f"Telegram disconnect notification error: {e}")
+
+    def on_irc_reconnected(self) -> None:
+        """Confirms restoration of the IRC link to the owner via Telegram."""
+        self.logger.log_service("INFO", "IRC connection restored after disconnect.")
+        if self.state.telegram_active:
+            try:
+                self.telegram_bot.notify_reconnected()
+            except Exception as e:
+                self.logger.log_service("WARN", f"Telegram reconnect notification error: {e}")
 
     def on_whois_reply(self, target_nick: str, line: str, final: bool) -> None:
         """Forwards buffered WHOIS server replies to the Telegram bot."""

@@ -11,6 +11,7 @@ Maintains transient runtime state that is NOT persisted to the config file:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set
@@ -58,6 +59,91 @@ class RuntimeState:
         self.start_time: float = time.time()
         self.reconnect_attempts: int = 0
         self.last_disconnect_time: Optional[float] = None
+
+        # 7. Disconnect alert tracking (Telegram notification dedup)
+        # Set when a disconnect notification is dispatched; cleared once the
+        # bot successfully re-registers on IRC (RPL_WELCOME).
+        self.disconnect_notified: bool = False
+
+        # 8. Manual reconnect control (from Telegram buttons / commands)
+        # _auto_reconnect_enabled: automatic backoff reconnection allowed.
+        # _manual_reconnect_requested: user asked for an immediate reconnect.
+        # _owner_disconnect_requested: owner explicitly disconnected via
+        #     /disconirc; the IRC loop stays fully idle until /conirc.
+        # _immediate_reconnect_wait: seconds to wait before a manual reconnect
+        #     attempt so the IRC worker loop can interrupt its current backoff.
+        self._auto_reconnect_enabled: bool = True
+        self._manual_reconnect_requested: bool = False
+        self._owner_disconnect_requested: bool = False
+        self._immediate_reconnect_wait: float = 1.0
+        self._reconnect_lock = threading.Lock()
+
+    # ---- Disconnect Alert Tracking ----
+    def should_send_disconnect_alert(self) -> bool:
+        """Returns True and marks the alert as sent (atomic check-and-set)."""
+        with self._reconnect_lock:
+            if self.disconnect_notified:
+                return False
+            self.disconnect_notified = True
+            return True
+
+    def clear_disconnect_alert(self) -> None:
+        """Resets the disconnect alert flag after successful reconnection."""
+        with self._reconnect_lock:
+            self.disconnect_notified = False
+
+    # ---- Manual Reconnect Controls ----
+    @property
+    def auto_reconnect_enabled(self) -> bool:
+        return self._auto_reconnect_enabled
+
+    def set_auto_reconnect(self, enabled: bool) -> None:
+        with self._reconnect_lock:
+            self._auto_reconnect_enabled = enabled
+
+    def request_manual_reconnect(self) -> None:
+        """Flags an immediate reconnect attempt and re-enables auto-reconnect."""
+        with self._reconnect_lock:
+            self._manual_reconnect_requested = True
+            self._auto_reconnect_enabled = True
+
+    def consume_manual_reconnect(self) -> bool:
+        """Atomically checks and clears the manual reconnect request flag."""
+        with self._reconnect_lock:
+            requested = self._manual_reconnect_requested
+            self._manual_reconnect_requested = False
+            return requested
+
+    # ---- Owner Connect / Disconnect Controls (/conirc & /disconirc) ----
+    @property
+    def owner_disconnect_requested(self) -> bool:
+        """True while the owner has explicitly disconnected the bot via /disconirc."""
+        return self._owner_disconnect_requested
+
+    def request_owner_connect(self) -> None:
+        """Clears the /disconirc hold and asks for an immediate IRC connection."""
+        with self._reconnect_lock:
+            self._owner_disconnect_requested = False
+            self._manual_reconnect_requested = True
+            self._auto_reconnect_enabled = True
+
+    def request_owner_disconnect(self) -> None:
+        """Holds the IRC link closed until the owner issues /conirc.
+
+        Disables both automatic backoff reconnection and any pending manual
+        reconnect request so the worker loop stays fully idle.
+        """
+        with self._reconnect_lock:
+            self._owner_disconnect_requested = True
+            self._auto_reconnect_enabled = False
+            self._manual_reconnect_requested = False
+
+    def get_reconnect_sleep(self, configured_delay: float) -> float:
+        """Backoff sleep duration honoring a pending manual reconnect request."""
+        with self._reconnect_lock:
+            if self._manual_reconnect_requested:
+                return min(configured_delay, self._immediate_reconnect_wait)
+            return configured_delay
 
     # ---- Channel Management ----
     @property

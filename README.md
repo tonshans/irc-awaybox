@@ -104,6 +104,9 @@ sudo systemctl status awaybox
 | `/unignore Nick` | Menghapus nickname dari daftar abaikan |
 | `/log #channel` | Mengambil 20 baris riwayat terakhir channel |
 | `/log Nick` | Mengambil 20 baris riwayat terakhir pesan pribadi |
+| `/reconnect [now\|auto\|stop]` | Kontrol reconnect IRC dari Telegram |
+| `/conirc` | Menghubungkan (atau menyambung ulang) koneksi bot ke IRC sekarang |
+| `/disconirc` | Memutus koneksi bot dari IRC; tetap offline sampai `/conirc` |
 | `/cancel` | Membatalkan sesi balasan yang sedang aktif |
 
 ---

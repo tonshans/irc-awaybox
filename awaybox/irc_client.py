@@ -11,6 +11,8 @@ Manages persistent connection to an IRC network:
 - Clean PRIVMSG parsing for channel and private messages
 - Exponential backoff reconnect: 5, 10, 20, 40, 80, 160, max 300s
 - Resilient non-blocking or worker thread architecture
+- Disconnect/reconnect alerts forwarded through callbacks so the owner can be
+  notified via Telegram and choose to reconnect or pause auto-reconnect
 """
 
 from __future__ import annotations
@@ -94,16 +96,25 @@ class IRCClient:
         logger: AwayBoxLogger,
         on_message_callback: Optional[Callable[[str, str, str, bool], None]] = None,
         on_whois_reply_callback: Optional[Callable[[str, str, bool], None]] = None,
+        on_disconnect_callback: Optional[Callable[[str], None]] = None,
+        on_reconnect_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         """
         on_message_callback(sender, target, text, is_channel)
         on_whois_reply_callback(target_nick, line, final)
+        on_disconnect_callback(reason) - invoked when the IRC link drops
+            (unexpectedly or after a failed connection attempt), so the
+            application can alert the owner via Telegram.
+        on_reconnect_callback() - invoked when the bot successfully
+            re-registers on IRC (RPL_WELCOME) after a prior disconnect alert.
         """
         self.config = config
         self.state = state
         self.logger = logger
         self.on_message = on_message_callback
         self.on_whois_reply = on_whois_reply_callback
+        self.on_disconnect = on_disconnect_callback
+        self.on_reconnect = on_reconnect_callback
 
         self._socket: Optional[socket.socket | ssl.SSLSocket] = None
         self._stop_event = threading.Event()
@@ -182,6 +193,58 @@ class IRCClient:
             return self._send_raw(f"PART {ch} :Leaving")
         return False
 
+    def force_reconnect(self) -> None:
+        """Drops the current link (if any) and requests an immediate reconnect.
+
+        Used by the Telegram /reconnect command and the inline Reconnect button.
+        """
+        self.state.request_manual_reconnect()
+        if self._connected:
+            self.logger.log_service("INFO", "Forcing disconnect for immediate manual reconnect...")
+            self._disconnect(reason="Reconnect manual diminta dari Telegram.")
+
+    def connect_now(self) -> bool:
+        """Connects to IRC immediately from Telegram (/conirc).
+
+        If already connected, drops the current link first so a fresh session
+        is established; otherwise clears the /disconirc hold and wakes the
+        worker loop so it connects without waiting for the backoff delay.
+        Returns True when the connection attempt was initiated.
+        """
+        if self._stop_event.is_set():
+            self.logger.log_service("WARN", "connect_now ignored: IRC client is shutting down.")
+            return False
+
+        if self._connected:
+            self.logger.log_service("INFO", "Reconnecting to IRC (requested from Telegram via /conirc)...")
+            self.state.request_owner_connect()
+            # Owner-initiated drop: send_quit=True suppresses the disconnect
+            # alert while still transmitting QUIT and closing the socket.
+            self._disconnect(send_quit=True)
+            return True
+
+        self.logger.log_service("INFO", "Menghubungkan ke IRC (diminta dari Telegram via /conirc)...")
+        self.state.request_owner_connect()
+        return True
+
+    def disconnect(self) -> bool:
+        """Disconnects from IRC on owner demand (/disconirc) and holds closed.
+
+        The bot sends QUIT, closes the socket, and stays offline (no automatic
+        or manual reconnection attempts) until the owner issues /conirc.
+        Returns True if a live link was terminated; False if already offline.
+        """
+        was_connected = self._connected
+        # Hold the link closed FIRST so the worker loop cannot race into a
+        # new connection attempt while we are tearing the socket down.
+        self.state.request_owner_disconnect()
+        if was_connected:
+            self.logger.log_service("INFO", "Disconnecting from IRC (requested from Telegram via /disconirc)...")
+            self._disconnect(send_quit=True)
+        else:
+            self.logger.log_service("INFO", "Already disconnected from IRC; /disconirc hold engaged.")
+        return was_connected
+
     def _apply_chanserv(self, channel: str) -> None:
         """Executes optional ChanServ template command if configured."""
         if self.config.irc.chanserv_enabled and self.config.irc.chanserv_command_template:
@@ -233,8 +296,14 @@ class IRCClient:
             self.state.irc_connected = False
             return False
 
-    def _disconnect(self, send_quit: bool = False) -> None:
-        """Closes the socket connection."""
+    def _disconnect(self, send_quit: bool = False, reason: str = "") -> None:
+        """Closes the socket connection.
+
+        When an established link drops unexpectedly (send_quit=False), the
+        on_disconnect callback is fired once so the owner can be alerted via
+        Telegram. Graceful shutdowns never trigger alerts.
+        """
+        was_connected = self._connected
         self._connected = False
         self.state.irc_connected = False
         self.state.irc_authenticated = False
@@ -248,10 +317,25 @@ class IRCClient:
                     pass
                 self._socket = None
 
+        if was_connected and not send_quit and self.on_disconnect:
+            try:
+                self.on_disconnect(reason or "Koneksi IRC terputus secara tak terduga.")
+            except Exception as e:
+                self.logger.log_service("ERROR", f"Disconnect callback error: {e}")
+
     def _handle_registration_complete(self) -> None:
         """Triggered when server responds with 001 (RPL_WELCOME)."""
         self.logger.log_service("INFO", f"Registered successfully on IRC as {self.config.irc.nick}.")
         self._reset_backoff()
+
+        # Reconnection succeeded: clear the dedup flag and notify the owner.
+        was_down = self.state.disconnect_notified
+        self.state.clear_disconnect_alert()
+        if was_down and self.on_reconnect:
+            try:
+                self.on_reconnect()
+            except Exception as e:
+                self.logger.log_service("ERROR", f"Reconnect callback error: {e}")
 
         if self.config.irc.nickserv_enabled and self.config.irc_password:
             self.logger.log_service("INFO", "Authenticating with NickServ...")
@@ -331,15 +415,36 @@ class IRCClient:
 
         while not self._stop_event.is_set():
             if not self._connected:
+                # Owner explicitly disconnected via /disconirc: stay fully
+                # idle until /conirc clears the hold. Never alert, never retry.
+                if self.state.owner_disconnect_requested:
+                    self._stop_event.wait(2.0)
+                    continue
+
+                # Manual "don't reconnect" switch: idle until the owner asks
+                # for a reconnect via Telegram (/reconnect or the button).
+                if not self.state.auto_reconnect_enabled:
+                    if self.state.consume_manual_reconnect():
+                        self.logger.log_service("INFO", "Manual reconnect requested from Telegram. Trying now...")
+                    else:
+                        self._stop_event.wait(2.0)
+                        continue
+
                 success = self._connect()
                 if not success:
                     delay = self._calculate_next_backoff()
+                    # A pending manual reconnect request shortens the wait
+                    delay = self.state.get_reconnect_sleep(delay)
                     self.state.reconnect_attempts += 1
                     self.state.last_disconnect_time = time.time()
                     self.logger.log_service(
                         "WARN",
                         f"Reconnecting in {int(delay)}s (attempt {self.state.reconnect_attempts})..."
                     )
+                    if self.state.should_send_disconnect_alert():
+                        self._fire_disconnect_alert(
+                            f"Gagal terhubung ke IRC server {self.config.irc.server}:{self.config.irc.port}."
+                        )
                     # Interruptible sleep
                     self._stop_event.wait(delay)
                     continue
@@ -350,7 +455,7 @@ class IRCClient:
                 chunk = self._socket.recv(4096)
                 if not chunk:
                     self.logger.log_service("WARN", "IRC socket closed by remote server.")
-                    self._disconnect()
+                    self._disconnect(reason="Server IRC menutup koneksi (socket closed by remote).")
                     continue
 
                 buffer += chunk.decode("utf-8", errors="replace")
@@ -365,12 +470,21 @@ class IRCClient:
                     self._send_raw(f"PING :{self.config.irc.server}")
                     continue
                 self.logger.log_service("WARN", f"IRC socket read error: {e}")
-                self._disconnect()
+                self._disconnect(reason=f"Kesalahan socket IRC: {e}")
             except OSError as e:
                 self.logger.log_service("WARN", f"IRC connection dropped: {e}")
-                self._disconnect()
+                self._disconnect(reason=f"Koneksi IRC terputus: {e}")
             except Exception as e:
                 self.logger.log_service("ERROR", f"Unexpected IRC error: {e}")
-                self._disconnect()
+                self._disconnect(reason=f"Kesalahan tak terduga pada koneksi IRC: {e}")
 
-        self._disconnect()
+        self._disconnect(send_quit=True)
+
+    def _fire_disconnect_alert(self, reason: str) -> None:
+        """Dispatches the disconnect alert callback once per outage window."""
+        if not self.on_disconnect:
+            return
+        try:
+            self.on_disconnect(reason)
+        except Exception as e:
+            self.logger.log_service("ERROR", f"Disconnect callback error: {e}")
