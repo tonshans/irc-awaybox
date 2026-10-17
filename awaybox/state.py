@@ -87,8 +87,20 @@ class RuntimeState:
         self._reconnect_lock = threading.Lock()
 
     # ---- Disconnect Alert Tracking ----
-    def should_send_disconnect_alert(self) -> bool:
-        """Returns True and marks the alert as sent (atomic check-and-set)."""
+    def claim_disconnect_alert(self) -> bool:
+        """Atomically claims the right to dispatch a disconnect alert.
+
+        Returns True (and marks the alert as sent) when no alert has been
+        dispatched for the current outage window yet; False otherwise. The
+        flag is cleared once the bot successfully re-registers on IRC
+        (RPL_WELCOME), so exactly one alert goes out per outage.
+
+        NOTE: this is a check-and-SET — calling it twice in a row returns
+        True only once. Callers that merely want to inspect whether an
+        alert is still pending must use ``disconnect_alert_pending()``
+        instead, or the second caller will observe "already sent" and
+        silently drop the notification (bug #1 fix).
+        """
         with self._reconnect_lock:
             if self.disconnect_notified:
                 return False
@@ -96,16 +108,12 @@ class RuntimeState:
             return True
 
     def disconnect_alert_pending(self) -> bool:
-        """Non-destructive check: True when an alert has NOT been sent yet.
-
-        Used by callers that must claim the flag themselves via
-        ``should_send_disconnect_alert()`` after actually dispatching the
-        alert. Checking the same atomic flag twice (pre-check in the IRC
-        loop + re-check in the app handler) would silently drop every
-        "connection failed" alert (bug #1 fix).
-        """
+        """Non-destructive check: True when an alert has NOT been sent yet."""
         with self._reconnect_lock:
             return not self.disconnect_notified
+
+    # Deprecated alias kept for backward compatibility with external callers.
+    should_send_disconnect_alert = claim_disconnect_alert
 
     def clear_disconnect_alert(self) -> None:
         """Resets the disconnect alert flag after successful reconnection."""

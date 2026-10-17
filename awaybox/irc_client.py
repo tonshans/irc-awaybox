@@ -149,7 +149,14 @@ class IRCClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        """Thread-safe read of the connection flag (bug #14 fix).
+
+        The IRC worker thread writes this flag while the Telegram thread
+        reads it through the public command handlers; both sides now go
+        through ``self._lock`` so no stale value can be observed.
+        """
+        with self._lock:
+            return self._connected
 
     def start(self) -> None:
         """Starts the IRC client worker thread."""
@@ -171,6 +178,10 @@ class IRCClient:
         ``rstrip`` alone only trims trailing newlines, so an unsanitized value
         (e.g. a config realname or channel name containing "\\r\\n") could be
         split into two protocol lines — an IRC command injection (bug #7 fix).
+
+        NOTE: must only be called while NOT holding ``self._lock`` (bug #14
+        fix) — it acquires the lock itself to read the connection flag and
+        write to the socket atomically.
         """
         with self._lock:
             if not self._socket or not self._connected:
@@ -212,7 +223,9 @@ class IRCClient:
         report success because the request IS honored (just deferred), instead
         of silently mutating state while telling the owner it failed (bug #10).
         """
-        ch = channel.strip()
+        ch = "".join(c for c in channel.strip() if c not in "\r\n")
+        if not ch:
+            return False
         if not ch.startswith("#") and not ch.startswith("&"):
             ch = f"#{ch}"
         self.state.add_channel(ch)
@@ -223,7 +236,7 @@ class IRCClient:
 
     def leave_channel(self, channel: str) -> bool:
         """Sends PART command and removes from runtime state."""
-        ch = channel.strip()
+        ch = "".join(c for c in channel.strip() if c not in "\r\n")
         self.state.remove_channel(ch)
         if self.is_connected:
             return self._send_raw(f"PART {ch} :Leaving")
@@ -241,7 +254,9 @@ class IRCClient:
         if self.state.owner_disconnect_requested:
             return False
         self.state.request_manual_reconnect()
-        if self._connected:
+        with self._lock:
+            connected = self._connected
+        if connected:
             self.logger.log_service("INFO", "Forcing disconnect for immediate manual reconnect...")
             self._disconnect(reason="Reconnect manual diminta dari Telegram.")
         return True
@@ -258,7 +273,9 @@ class IRCClient:
             self.logger.log_service("WARN", "connect_now ignored: IRC client is shutting down.")
             return False
 
-        if self._connected:
+        with self._lock:
+            connected = self._connected
+        if connected:
             self.logger.log_service("INFO", "Reconnecting to IRC (requested from Telegram via /conirc)...")
             self.state.request_owner_connect()
             # Owner-initiated drop: send_quit=True suppresses the disconnect
@@ -277,7 +294,7 @@ class IRCClient:
         or manual reconnection attempts) until the owner issues /conirc.
         Returns True if a live link was terminated; False if already offline.
         """
-        was_connected = self._connected
+        was_connected = self.is_connected  # lock-protected read (bug #14 fix)
         # Hold the link closed FIRST so the worker loop cannot race into a
         # new connection attempt while we are tearing the socket down.
         self.state.request_owner_disconnect()
@@ -319,8 +336,12 @@ class IRCClient:
                 sock = raw_sock
 
             sock.settimeout(self._read_timeout)  # wake up regularly for keepalive checks
-            self._socket = sock
-            self._connected = True
+            # Publish socket + connection flag atomically (bug #14 fix): the
+            # Telegram thread reads both through self._lock, so it can never
+            # observe _connected=True while _socket is still unset.
+            with self._lock:
+                self._socket = sock
+                self._connected = True
             self.state.irc_connected = True
             self.state.reconnect_attempts = 0
 
@@ -344,7 +365,8 @@ class IRCClient:
                     raw_sock.close()
                 except Exception:
                     pass
-            self._connected = False
+            with self._lock:  # lock-protected write (bug #14 fix)
+                self._connected = False
             self.state.irc_connected = False
             return False
 
@@ -355,24 +377,29 @@ class IRCClient:
         on_disconnect callback is fired once so the owner can be alerted via
         Telegram. Graceful shutdowns never trigger alerts.
         """
-        was_connected = self._connected
+        # Claim the connection atomically under the lock (bug #14 fix): a
+        # concurrent Telegram-initiated _disconnect() can never double-send
+        # QUIT or double-fire the disconnect alert for the same live link.
+        with self._lock:
+            was_connected = self._connected
+            sock = self._socket if was_connected else None
+            if was_connected:
+                self._connected = False
+                self._socket = None
         if was_connected:
             # Record the outage moment for every drop path (not just failed
             # connect attempts) so the Telegram alert shows a real "N detik
             # lalu" instead of always claiming "baru saja" (bug #11 fix).
             self.state.last_disconnect_time = time.time()
-        self._connected = False
         self.state.irc_connected = False
         self.state.irc_authenticated = False
-        with self._lock:
-            if self._socket:
-                try:
-                    if send_quit:
-                        self._socket.sendall(b"QUIT :AwayBox Shutting Down\r\n")
-                    self._socket.close()
-                except Exception:
-                    pass
-                self._socket = None
+        if sock is not None:
+            try:
+                if send_quit:
+                    sock.sendall(b"QUIT :AwayBox Shutting Down\r\n")
+                sock.close()
+            except Exception:
+                pass
 
         if was_connected and not send_quit and self.on_disconnect:
             try:
@@ -475,7 +502,7 @@ class IRCClient:
         buffer = ""
 
         while not self._stop_event.is_set():
-            if not self._connected:
+            if not self.is_connected:  # lock-protected read (bug #14 fix)
                 # Owner explicitly disconnected via /disconirc: stay fully
                 # idle until /conirc clears the hold. Never alert, never retry.
                 if self.state.owner_disconnect_requested:
@@ -502,11 +529,12 @@ class IRCClient:
                         "WARN",
                         f"Reconnecting in {int(delay)}s (attempt {self.state.reconnect_attempts})..."
                     )
-                    # Claim the dedup flag HERE only (atomic check-and-set) and
-                    # dispatch unconditionally. The app handler must not re-check
-                    # the same flag, or every "connection failed" alert would be
-                    # silently dropped (bug #1 fix).
-                    if self.state.should_send_disconnect_alert():
+                    # Claim the dedup flag HERE only (atomic check-and-set via
+                    # state.claim_disconnect_alert) and dispatch unconditionally.
+                    # The app handler must not re-check the same flag, or every
+                    # "connection failed" alert would be silently dropped
+                    # (bug #1 fix).
+                    if self.state.claim_disconnect_alert():
                         self._fire_disconnect_alert(
                             f"Gagal terhubung ke IRC server {self.config.irc.server}:{self.config.irc.port}."
                         )

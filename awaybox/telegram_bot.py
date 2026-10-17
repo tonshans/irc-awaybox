@@ -892,8 +892,6 @@ class TelegramBot:
 
                 for update in updates:
                     update_id = update.get("update_id", 0)
-                    if update_id > self._last_update_id:
-                        self._last_update_id = update_id
 
                     # 1. Message event
                     if "message" in update:
@@ -907,6 +905,13 @@ class TelegramBot:
                     # 2. Callback query event
                     elif "callback_query" in update:
                         self.handle_callback_query(update["callback_query"])
+
+                    # Advance the offset only AFTER the update has been fully
+                    # processed (bug #13 fix). Incrementing it beforehand meant
+                    # a handler exception lost the owner's message forever:
+                    # the offset moved past an update that was never handled.
+                    if update_id > self._last_update_id:
+                        self._last_update_id = update_id
 
             except Exception as e:
                 # Isolates Telegram errors from crashing service

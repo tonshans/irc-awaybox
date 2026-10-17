@@ -70,11 +70,10 @@ class AwayBoxApp:
         """Alerts the owner via Telegram when the IRC link drops.
 
         Deduplication is owned by the caller (IRCClient): the loop claims the
-        flag through ``RuntimeState.should_send_disconnect_alert()`` before
-        invoking this handler. Re-checking that atomic check-and-set flag here
-        would always see "already sent" and silently drop every alert — most
-        visibly the "connection failed" alert during a full server outage
-        (bug #1 fix).
+        flag through ``RuntimeState.claim_disconnect_alert()`` before invoking
+        this handler. Re-running that atomic check-and-set here would always
+        see "already sent" and silently drop every alert — most visibly the
+        "connection failed" alert during a full server outage (bug #1 fix).
         """
         self.logger.log_service("WARN", f"IRC disconnected: {reason}")
         if self.state.telegram_active:
